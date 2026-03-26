@@ -1,9 +1,12 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import gc
 import inspect
 import linecache
 import os
+from pathlib import Path
+import resource
 import sys
 import threading
 import time
@@ -19,6 +22,12 @@ T = TypeVar("T")
 
 # Maximum length of a single object string to print.
 PRINT_LOCAL_MAX_LENGTH = 250
+
+# Memory threshold: trigger OOM dump when available memory drops below this (GB).
+# Set via ENERGON_MEM_AVAIL_THRESHOLD_GB. Default 200 GB.
+_MEM_AVAIL_THRESHOLD_GB = float(os.environ.get("ENERGON_MEM_AVAIL_THRESHOLD_GB", "600"))
+# How often the daemon thread checks memory (seconds).
+_MEM_CHECK_INTERVAL = float(os.environ.get("ENERGON_MEM_CHECK_INTERVAL", "5"))
 
 
 class Watchdog:
@@ -63,6 +72,7 @@ class Watchdog:
             self._deadline = None
 
         self._stop = False  # signals permanent shutdown (finish)
+        self._mem_dumped = False  # only dump once per watchdog instance
 
         # Condition variable to manage state changes
         self._cv = threading.Condition()
@@ -79,33 +89,162 @@ class Watchdog:
 
     def _worker(self) -> None:
         """
-        Background thread that periodically checks if the watchdog has expired.
-        Once it times out or is told to stop, it exits.
+        Background daemon thread that:
+        1) Checks if the watchdog deadline has expired (timeout).
+        2) Periodically checks available memory and dumps diagnostics if low.
         """
         while True:
             with self._cv:
                 if self._stop:
-                    # finish() was called; end the worker.
                     return
 
+                # --- Memory check (runs every iteration, ~every _MEM_CHECK_INTERVAL seconds) ---
+                if not self._mem_dumped and _MEM_AVAIL_THRESHOLD_GB > 0:
+                    try:
+                        avail = get_mem_available_gb()
+                        rss = get_rss_gb()
+                        if avail < _MEM_AVAIL_THRESHOLD_GB:
+                            self._mem_dumped = True
+                            print(
+                                f"[MEM_WATCHDOG] pid={os.getpid()} MEMORY LOW: "
+                                f"avail={avail:.1f}G < threshold={_MEM_AVAIL_THRESHOLD_GB:.0f}G, "
+                                f"rss={rss:.1f}G  — dumping stacks & memory stats",
+                                flush=True,
+                            )
+                            self._print_all_thread_stacks(skip_thread_id=threading.get_ident())
+                            self._print_memory_stats()
+                    except Exception:
+                        pass
+
+                # --- Watchdog timeout check ---
                 if self._deadline is None:
-                    # Disabled; no deadline. Just wait a bit, then re-check.
-                    self._cv.wait(timeout=1.0)
+                    self._cv.wait(timeout=_MEM_CHECK_INTERVAL)
                     continue
 
                 remaining = self._deadline - perf_counter()
                 if remaining <= 0:
-                    # We have timed out
                     self._on_timeout()
                     return
                 else:
-                    # Wait until either the deadline or a state change
-                    self._cv.wait(timeout=remaining)
+                    self._cv.wait(timeout=min(remaining, _MEM_CHECK_INTERVAL))
+
+    @staticmethod
+    def _print_memory_stats() -> None:
+        """Dump process and GPU memory stats to help diagnose OOM.
+        Writes to both stdout and a per-PID file to avoid interleaving."""
+        pid = os.getpid()
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        dump_dir = Path("/tmp/watchdog_dumps")
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        dump_path = dump_dir / f"watchdog_mem_pid{pid}_{ts}.txt"
+
+        lines = []
+        lines.append("=" * 60)
+        lines.append(f"Watchdog Memory Report  pid={pid}  ts={ts}")
+        lines.append("=" * 60)
+
+        # 1) Process RSS / VMS from /proc/self/status
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith(("VmRSS:", "VmHWM:", "VmSize:", "VmPeak:", "VmSwap:", "Threads:")):
+                        lines.append(f"  {line.rstrip()}")
+        except Exception:
+            # Fallback: resource module
+            ru = resource.getrusage(resource.RUSAGE_SELF)
+            lines.append(f"  maxrss (resource): {ru.ru_maxrss} KB")
+
+        # 2) Python GC stats
+        gc_stats = gc.get_stats()
+        lines.append(f"  gc generations: {[{'collections': s['collections'], 'collected': s['collected'], 'uncollectable': s['uncollectable']} for s in gc_stats]}")
+        lines.append(f"  gc tracked objects: {len(gc.get_objects())}")
+
+        # 3) GPU memory (all visible devices)
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                try:
+                    alloc = torch.cuda.memory_allocated(i) / (1024 ** 3)
+                    reserved = torch.cuda.memory_reserved(i) / (1024 ** 3)
+                    max_alloc = torch.cuda.max_memory_allocated(i) / (1024 ** 3)
+                    max_reserved = torch.cuda.max_memory_reserved(i) / (1024 ** 3)
+                    lines.append(
+                        f"  GPU {i}: alloc={alloc:.2f}G  reserved={reserved:.2f}G  "
+                        f"max_alloc={max_alloc:.2f}G  max_reserved={max_reserved:.2f}G"
+                    )
+                except Exception as e:
+                    lines.append(f"  GPU {i}: <error: {e}>")
+
+        # 4) Top 10 object types by count (lightweight)
+        try:
+            import collections as _collections
+            type_counts = _collections.Counter(type(o).__name__ for o in gc.get_objects())
+            lines.append("  Top 10 GC object types by count:")
+            for name, count in type_counts.most_common(10):
+                lines.append(f"    {name}: {count}")
+        except Exception:
+            pass
+
+        # 5) PIL images alive in GC
+        try:
+            from PIL.Image import Image as _PILImage
+            _pil_objs = [(o.size, o.mode) for o in gc.get_objects() if isinstance(o, _PILImage)]
+            _pil_mb = sum(w * h * len(m) / (1024 ** 2) for (w, h), m in _pil_objs)
+            lines.append(
+                f"  PIL images in GC: count={len(_pil_objs)}, est_ram={_pil_mb:.1f}MB"
+            )
+            if _pil_objs:
+                import collections as _collections
+                _size_counts = _collections.Counter((w, h) for (w, h), _ in _pil_objs)
+                for (w, h), cnt in _size_counts.most_common(10):
+                    lines.append(f"    {w}x{h}: {cnt} image(s)")
+        except Exception:
+            pass
+
+        # 6) Large CPU tensors (likely pixel-value buffers)
+        try:
+            _large = [
+                o for o in gc.get_objects()
+                if isinstance(o, torch.Tensor) and not o.is_cuda and o.numel() > 100_000
+            ]
+            _large.sort(key=lambda t: t.numel(), reverse=True)
+            _tensor_mb = sum(t.numel() * t.element_size() for t in _large) / (1024 ** 2)
+            lines.append(
+                f"  Large CPU tensors (>100k elem): count={len(_large)}, total={_tensor_mb:.1f}MB"
+            )
+            for t in _large[:10]:
+                lines.append(
+                    f"    shape={list(t.shape)} dtype={t.dtype} "
+                    f"{t.numel() * t.element_size() / (1024**2):.1f}MB"
+                )
+        except Exception:
+            pass
+
+        # 7) Open file descriptors
+        try:
+            fd_count = len(os.listdir("/proc/self/fd"))
+            lines.append(f"  Open FDs: {fd_count}")
+        except Exception:
+            pass
+
+        lines.append("=" * 60)
+        report = "\n".join(lines)
+
+        # Write to file (atomic per-PID, no conflict)
+        try:
+            with open(dump_path, "w") as f:
+                f.write(report + "\n")
+            print(f"Watchdog memory report written to {dump_path}", flush=True)
+        except Exception:
+            pass
+
+        # Also print to stdout
+        print(report, flush=True)
 
     def _on_timeout(self) -> None:
         """
         Called exactly once if the watchdog times out.
         1) Optionally dumps stacks,
+        1.5) Dump memory stats (RSS, GPU, GC) for OOM diagnosis,
         2) Calls user callback,
         3) If callback raises an error,
            - print traceback,
@@ -118,6 +257,12 @@ class Watchdog:
         if self._dump_stacks:
             print("Watchdog triggered: Dumping thread stacks")
             self._print_all_thread_stacks(skip_thread_id=watchdog_thread_id)
+
+        # 1.5) Always dump memory stats for OOM diagnosis
+        try:
+            self._print_memory_stats()
+        except Exception:
+            traceback.print_exc()
 
         # 2) Call user callback
         if self._callback:
@@ -299,6 +444,49 @@ def repr_short(obj: Any) -> str:
     if len(s) > PRINT_LOCAL_MAX_LENGTH:
         s = s[: PRINT_LOCAL_MAX_LENGTH // 2] + "..." + s[-PRINT_LOCAL_MAX_LENGTH // 2 :]
     return s
+
+
+def get_rss_gb() -> float:
+    """Return current process RSS in GB. Cheap: reads one line from /proc."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / (1024 * 1024)  # kB → GB
+    except Exception:
+        pass
+    return 0.0
+
+
+def get_mem_available_gb() -> float:
+    """Return available memory in GB, cgroup-aware.
+    Checks cgroup limit first (container/k8s), falls back to /proc/meminfo."""
+    try:
+        # cgroup v1
+        limit = int(open("/sys/fs/cgroup/memory/memory.limit_in_bytes").read().strip())
+        usage = int(open("/sys/fs/cgroup/memory/memory.usage_in_bytes").read().strip())
+        return (limit - usage) / (1024 ** 3)
+    except Exception:
+        pass
+    try:
+        # cgroup v2
+        limit_s = open("/sys/fs/cgroup/memory.max").read().strip()
+        if limit_s == "max":
+            raise ValueError("no cgroup limit")
+        limit = int(limit_s)
+        usage = int(open("/sys/fs/cgroup/memory.current").read().strip())
+        return (limit - usage) / (1024 ** 3)
+    except Exception:
+        pass
+    try:
+        # fallback: host-wide
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024 * 1024)  # kB → GB
+    except Exception:
+        pass
+    return float("inf")
 
 
 if __name__ == "__main__":

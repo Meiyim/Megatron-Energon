@@ -1,15 +1,19 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import os
 import warnings
 from typing import Any, Dict, Generic, Iterator, Optional, TypeVar
 
 from megatron.energon.flavors.base_dataset import SavableDataset
-from megatron.energon.watchdog import Watchdog
+from megatron.energon.watchdog import Watchdog, get_rss_gb, get_mem_available_gb
 from megatron.energon.worker import WorkerConfig
 from megatron.energon.wrappers.base import BaseWrapperDataset
 
 T_sample = TypeVar("T_sample")
+
+# How often to log memory (in samples). 0 = disable.
+MEM_LOG_EVERY_N = int(os.environ.get("ENERGON_MEM_LOG_EVERY_N", "1"))
 
 
 class WatchdogDataset(BaseWrapperDataset[T_sample, T_sample], Generic[T_sample]):
@@ -23,20 +27,11 @@ class WatchdogDataset(BaseWrapperDataset[T_sample, T_sample], Generic[T_sample])
         initial_timeout_seconds: Optional[float] = None,
         fail_on_timeout: bool = False,
     ):
-        """Construct the watchdog dataset, which wraps another dataset and watches
-        the time it takes to yield samples from the wrapped dataset.
-
-        Args:
-            dataset: The input dataset to wrap
-            worker_config: The worker configuration
-            timeout_seconds: The timeout in seconds. If None, the watchdog is disabled.
-            initial_timeout_seconds: The initial timeout in seconds. If None, the timeout is the same as timeout_seconds.
-            fail_on_timeout: If True, stops the whole process upon timeout, after printing a stack trace.
-        """
         super().__init__(dataset, worker_config=worker_config)
         self.timeout_seconds = timeout_seconds
         self.initial_timeout_seconds = initial_timeout_seconds
         self.fail_on_timeout = fail_on_timeout
+        self._sample_count = 0
 
     def reset_state_own(self) -> None:
         pass
@@ -46,7 +41,6 @@ class WatchdogDataset(BaseWrapperDataset[T_sample, T_sample], Generic[T_sample])
 
     def _watchdog_trigger(self) -> None:
         if self.fail_on_timeout:
-            # Raising an exception here will kill the whole process
             raise TimeoutError(
                 f"Watchdog triggered. Sample processing took longer than {self.timeout_seconds} seconds."
             )
@@ -56,9 +50,24 @@ class WatchdogDataset(BaseWrapperDataset[T_sample, T_sample], Generic[T_sample])
                 RuntimeWarning,
             )
 
+    def _log_memory(self) -> None:
+        """Print one-line memory status every N samples."""
+        self._sample_count += 1
+        if MEM_LOG_EVERY_N <= 0 or self._sample_count % MEM_LOG_EVERY_N != 0:
+            return
+        rss = get_rss_gb()
+        avail = get_mem_available_gb()
+        print(
+            f"[MEM] pid={os.getpid()} sample={self._sample_count} "
+            f"rss={rss:.1f}G avail={avail:.1f}G",
+            flush=True,
+        )
+
     def __iter__(self) -> Iterator[T_sample]:
         if self.timeout_seconds is None:
-            yield from self.dataset
+            for item in self.dataset:
+                self._log_memory()
+                yield item
         else:
             watchdog = Watchdog(
                 timeout=self.timeout_seconds,
@@ -66,10 +75,17 @@ class WatchdogDataset(BaseWrapperDataset[T_sample, T_sample], Generic[T_sample])
                 callback=self._watchdog_trigger,
                 enabled=False,
             )
-            yield from watchdog.watch_iter(self.dataset)
+            try:
+                watchdog.enable()
+                for item in self.dataset:
+                    watchdog.disable()
+                    self._log_memory()
+                    yield item
+                    watchdog.enable()
+            finally:
+                watchdog.disable()
 
     def config(self) -> Dict[str, Any]:
-        # Watchdog is transparent, it won't change the samples
         return self.dataset.config()
 
     def __str__(self):
