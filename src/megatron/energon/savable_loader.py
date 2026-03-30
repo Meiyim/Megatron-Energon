@@ -49,16 +49,25 @@ from megatron.energon.wrappers.watchdog_dataset import WatchdogDataset
 T = TypeVar("T")
 
 
-def _init_worker(seed_per_worker: List[int], worker_id: int):
+def _init_worker(seed_per_worker: List[int], dp_rank: int, num_workers: int, worker_id: int):
     """Initializes the the worker process.
 
     Sets the random seeds and prepare EPath for the forked worker process.
+    Staggers worker starts to avoid S3 request burst during buffer filling.
     """
     gc_init_worker(worker_id)
 
     worker_seed = seed_per_worker[worker_id]
 
     SystemRng.seed(worker_seed)
+
+    # Stagger worker starts to avoid S3 request burst at init time.
+    # Without this, all workers simultaneously fill their shuffle/packing buffers,
+    # causing RequestRateLimitExceeded on the S3 bucket.
+    # Use global worker ID (across all DP ranks) for proper staggering.
+    global_worker_id = dp_rank * num_workers + worker_id
+    if global_worker_id > 0:
+        time.sleep(global_worker_id * 0.5)
 
 
 class SimpleSavableDatasetWrapper(BaseWrapperDataset[T, Tuple[int, int, T]], Generic[T]):
@@ -793,7 +802,7 @@ class SavableDataLoader(DataLoader[T], Generic[T]):
             shuffle=False,
             num_workers=self.worker_config.num_workers,
             pin_memory=True,
-            worker_init_fn=partial(_init_worker, seed_per_worker),
+            worker_init_fn=partial(_init_worker, seed_per_worker, self.worker_config.rank, self.worker_config.num_workers),
             **kwargs,
         )
 
@@ -1287,7 +1296,7 @@ class BasicDataLoader(DataLoader[T], Generic[T]):
             shuffle=False,
             num_workers=self.worker_config.num_workers,
             pin_memory=True,
-            worker_init_fn=partial(_init_worker, seed_per_worker),
+            worker_init_fn=partial(_init_worker, seed_per_worker, self.worker_config.rank, self.worker_config.num_workers),
             **kwargs,
         )
         if self.worker_config.should_log(level=1):
