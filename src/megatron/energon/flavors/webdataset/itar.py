@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import contextlib
+import logging
 import struct
 import tarfile
 from types import TracebackType
@@ -10,6 +11,8 @@ from typing import BinaryIO, Dict, Generator, Optional, Tuple, Type, Union
 from megatron.energon.edataclass import edataclass
 from megatron.energon.epathlib import EPath
 from megatron.energon.retry_stream import RetryReadStream
+
+logger = logging.getLogger(__name__)
 
 ITAR_SUFFIX = ".tar.idx"
 
@@ -293,29 +296,35 @@ class CachedItarOffsetReader:
         sample_offset: int = 0,
     ) -> Tuple[int, int]:
         """
-        High-level API to get the byte offset and length for the given file & sample_offset.
+        High-level API to get the byte offset and length for the given file &
+        sample_offset, using the process-wide GlobalIdxHandleManager LRU cache.
+
+        Raises SkipSample when sample_offset is out of range in the idx file.
         """
+        from megatron.energon.errors import SkipSample
+        from megatron.energon.global_handle_manager import GlobalIdxHandleManager
 
-        # Find or create the suitable CacheEntry
-        key, entry = self._find_or_create_entry(tar_file, sample_offset)
+        manager = GlobalIdxHandleManager.get_instance()
+        tar_file_str = str(tar_file)
+        tar_index_reader = manager.acquire(tar_file_str)
 
-        # Use (and update) the per-entry lookahead logic
-        result_byte_offset, length = self._get_itar_byte_offset_with_entry(entry, sample_offset)
+        try:
+            result_byte_offset = 0 if sample_offset == 0 else tar_index_reader[sample_offset]
+        except IndexError:
+            logger.error(
+                f"[DATALOADER] [INDEX_ERROR] IndexError reading sample_offset={sample_offset} "
+                f"from tar_file={tar_file_str}, idx file may be corrupted or out of sync. "
+                f"Skipping this sample."
+            )
+            raise SkipSample(
+                f"IndexError: sample_offset={sample_offset} out of range in {tar_file_str}"
+            )
 
-        # Update cache entry with the new offset
-        self.tar_index_reader_cache.pop(key)
-        if entry.lookahead_offset is not None:
-            new_key = (str(tar_file), entry.lookahead_offset)
-            if new_key not in self.tar_index_reader_cache:
-                self.tar_index_reader_cache[new_key] = entry
-            else:
-                # Already have this entry in the cache, so we can close the reader and use the existing one
-                # TODO: We may actually may want to keep multiple readers open, because they may be multiple
-                # sequences to the same sequence.
-                entry.tar_index_reader.close()
-        else:
-            # No lookahead, so we can close the reader
-            entry.tar_index_reader.close()
+        try:
+            next_byte_offset = tar_index_reader[sample_offset + 1]
+            length = next_byte_offset - result_byte_offset
+        except IndexError:
+            length = 0
 
         return result_byte_offset, length
 

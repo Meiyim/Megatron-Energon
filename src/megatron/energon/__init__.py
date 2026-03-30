@@ -89,6 +89,10 @@ from megatron.energon.task_encoder import (
     get_val_datasets,
     stateless,
 )
+from megatron.energon.global_handle_manager import (
+    GlobalIdxHandleManager,
+    GlobalTarHandleManager,
+)
 from megatron.energon.worker import WorkerConfig
 from megatron.energon.wrappers import (
     BatchDataset,
@@ -157,6 +161,8 @@ __all__ = [
     "get_train_dataset",
     "get_val_dataset",
     "get_val_datasets",
+    "GlobalIdxHandleManager",
+    "GlobalTarHandleManager",
     "GroupBatchDataset",
     "homogeneous_concat_mix",
     "ImageClassificationSample",

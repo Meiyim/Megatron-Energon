@@ -3,6 +3,7 @@
 
 import contextlib
 import inspect
+import logging
 from typing import (
     Any,
     Callable,
@@ -16,7 +17,7 @@ from typing import (
     Union,
 )
 
-from megatron.energon.errors import ErrorContext, handle_restore_errors
+from megatron.energon.errors import ErrorContext, SkipSample, handle_restore_errors
 from megatron.energon.flavors.base_dataset import (
     SavableDataset,
     add_sample_restore_key,
@@ -29,6 +30,8 @@ from megatron.energon.wrappers.buffer import SavableSampleBuffer
 T_sample = TypeVar("T_sample")
 T_encoded_sample = TypeVar("T_encoded_sample")
 T_batch_sample = TypeVar("T_batch_sample")
+
+logger = logging.getLogger(__name__)
 
 
 class PackingDataset(
@@ -178,6 +181,9 @@ class PackingDataset(
         """
         Fill the reading buffer with samples from the dataset source iterator.
 
+        Catches ``SkipSample`` so that bad/corrupt samples do not crash the
+        DataLoader worker — the sample is simply skipped and filling continues.
+
         Args:
             source_iter: Iterator of samples from the dataset.
             log_progress: If True, log the progress of the filling.
@@ -194,6 +200,9 @@ class PackingDataset(
             pbar_ctx = contextlib.nullcontext()
             pbar = None
 
+        consecutive_skip_count = 0
+        max_consecutive_skips = 1000
+
         with pbar_ctx:
             while (
                 self._reading_buffer.len_worker() + self._pre_packing_buffer.len_worker()
@@ -202,10 +211,25 @@ class PackingDataset(
                 try:
                     sample = next(source_iter)
                     self._reading_buffer.append(sample)
+                    consecutive_skip_count = 0
                     if pbar is not None:
                         pbar.update(1)
                 except StopIteration:
                     return False
+                except SkipSample as e:
+                    consecutive_skip_count += 1
+                    if consecutive_skip_count <= 10 or consecutive_skip_count % 100 == 0:
+                        logger.warning(
+                            f"[PACKING_DATASET] SkipSample caught in _fill_reading_buffer: "
+                            f"{e}, consecutive_skips={consecutive_skip_count}"
+                        )
+                    if consecutive_skip_count >= max_consecutive_skips:
+                        logger.error(
+                            f"[PACKING_DATASET] Too many consecutive SkipSample "
+                            f"({consecutive_skip_count}), dataset may be broken. Stopping."
+                        )
+                        return False
+                    continue
         return True
 
     def __iter__(self) -> Iterator[T_batch_sample]:

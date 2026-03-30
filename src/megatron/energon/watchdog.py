@@ -27,7 +27,7 @@ PRINT_LOCAL_MAX_LENGTH = 250
 # Set via ENERGON_MEM_AVAIL_THRESHOLD_GB. Default 200 GB.
 _MEM_AVAIL_THRESHOLD_GB = float(os.environ.get("ENERGON_MEM_AVAIL_THRESHOLD_GB", "600"))
 # How often the daemon thread checks memory (seconds).
-_MEM_CHECK_INTERVAL = float(os.environ.get("ENERGON_MEM_CHECK_INTERVAL", "5"))
+_MEM_CHECK_INTERVAL = float(os.environ.get("ENERGON_MEM_CHECK_INTERVAL", "3600"))
 
 
 class Watchdog:

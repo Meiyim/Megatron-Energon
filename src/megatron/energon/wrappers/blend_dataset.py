@@ -1,16 +1,20 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.
 # SPDX-License-Identifier: BSD-3-Clause
 
-from typing import Any, Dict, Iterator, List, Sequence, Tuple, TypeVar
+import logging
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, TypeVar
 
 import torch
 
 from megatron.energon.flavors.base_dataset import SavableDataset, add_sample_restore_key
 from megatron.energon.rng import WorkerRng
+from megatron.energon.state import FlexState
 from megatron.energon.worker import WorkerConfig
 from megatron.energon.wrappers.base import BaseWrapperDataset
 
 T_sample = TypeVar("T_sample")
+
+logger = logging.getLogger(__name__)
 
 
 class BlendDataset(BaseWrapperDataset[T_sample, T_sample]):
@@ -108,6 +112,85 @@ class BlendDataset(BaseWrapperDataset[T_sample, T_sample]):
                 yield add_sample_restore_key(sample, ds_idx, src=self)
 
         self.exhausted = [False] * len(self.dataset_weights)
+
+    def save_state(self) -> FlexState:
+        """Save state with dataset path information for incremental resume."""
+        from megatron.energon.global_handle_manager import _get_dataset_path
+
+        state = super().save_state()
+        state["_dataset_paths"] = [_get_dataset_path(ds) for ds in self.datasets]
+        return state
+
+    def restore_state(self, state: FlexState) -> None:
+        """
+        Restore state using path-based matching for incremental resume.
+
+        If the checkpoint contains ``_dataset_paths``, sub-datasets are matched
+        by path rather than by index, so data sources can be added or removed
+        between runs without breaking resume.  Falls back to index-based
+        matching for old checkpoints (no path info).
+        """
+        from megatron.energon.global_handle_manager import _get_dataset_path
+
+        saved_paths: Optional[list] = state.get("_dataset_paths")
+        saved_states = state["datasets"]
+
+        if saved_paths is None:
+            # Old checkpoint without path info — fall back to index-based matching.
+            # Requires old sources to keep their order; new sources appended at end.
+            logger.warning(
+                "[BlendDataset] No _dataset_paths in checkpoint (old format), "
+                f"falling back to index-based matching "
+                f"(saved={len(saved_states)}, current={len(self.datasets)})"
+            )
+            saved_paths = [f"__index_{i}__" for i in range(len(saved_states))]
+            current_paths = [f"__index_{i}__" for i in range(len(self.datasets))]
+        else:
+            current_paths = [_get_dataset_path(ds) for ds in self.datasets]
+
+        path_to_state = {p: s for p, s in zip(saved_paths, saved_states) if p}
+
+        matched_count = new_count = 0
+        matched_paths: list = []
+        new_paths: list = []
+
+        for ds, current_path in zip(self.datasets, current_paths):
+            if current_path and current_path in path_to_state:
+                ds.restore_state(path_to_state[current_path])
+                matched_count += 1
+                matched_paths.append(current_path)
+            else:
+                new_count += 1
+                new_paths.append(current_path)
+
+        removed_paths = set(p for p in saved_paths if p) - set(p for p in current_paths if p)
+        removed_count = len(removed_paths)
+
+        # Restore own state
+        super(BaseWrapperDataset, self).restore_state(state)
+
+        # Restore exhausted flags by path
+        saved_exhausted = state.get("exhausted", [False] * len(saved_states))
+        path_to_exhausted = {p: e for p, e in zip(saved_paths, saved_exhausted) if p}
+        self.exhausted = [path_to_exhausted.get(p, False) for p in current_paths]
+
+        def _fmt(paths, n=5):
+            shown = list(paths)[:n]
+            s = "[" + ", ".join(str(p) for p in shown) + "]"
+            return s + (f" ... +{len(paths) - n} more" if len(paths) > n else "")
+
+        msg = (
+            f"[BlendDataset] Incremental Resume: "
+            f"ckpt={len(saved_states)}, current={len(self.datasets)}, "
+            f"matched={matched_count}, new={new_count}, removed={removed_count}"
+        )
+        if matched_count:
+            msg += f", matched_datasets={_fmt(matched_paths)}"
+        if removed_count:
+            msg += f", removed={_fmt(removed_paths)}"
+        if new_count:
+            msg += f", new_datasets={_fmt(new_paths)}"
+        logger.info(msg)
 
     def config(self) -> Dict[str, Any]:
         return {

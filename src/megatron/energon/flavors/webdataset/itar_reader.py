@@ -2,6 +2,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import contextlib
+import logging
+import time
 from abc import ABC, abstractmethod
 from bisect import bisect_right
 from typing import (
@@ -35,6 +37,8 @@ from megatron.energon.flavors.webdataset.structs import FilteredSample, ShardInf
 from megatron.energon.source_info import SourceInfo
 
 T_index = TypeVar("T_index", covariant=False)
+
+logger = logging.getLogger(__name__)
 
 
 class ITarReader(ABC, Generic[T_index]):
@@ -111,25 +115,12 @@ class ITarReader(ABC, Generic[T_index]):
 
     def _get_itarfile_cached(self, tar_file_id: int) -> ITarFile:
         """
-        Get the ITarFile object for the given tar file id.
-        If the file is not already open, open it. If we exceed
-        the global cache limit, close the least recently used file.
+        Get the ITarFile object for the given tar file id via the process-wide
+        GlobalTarHandleManager LRU cache.
         """
-        if tar_file_id not in self.itar_files_cache:
-            file_object = self.tar_filepaths[tar_file_id].open(mode="rb")
-            tar_file = ITarFile.open(fileobj=file_object, mode="r:")
-            self.itar_files_cache[tar_file_id] = tar_file
+        from megatron.energon.global_handle_manager import GlobalTarHandleManager
 
-        # If we hit the limit of open files, close the least recently used file
-        while len(self.itar_files_cache) > self.itar_cache_size:
-            # Get the oldest file
-            lru_key = next(iter(self.itar_files_cache))
-
-            self.itar_files_cache[lru_key].fileobj.close()
-            self.itar_files_cache[lru_key].close()
-            del self.itar_files_cache[lru_key]
-
-        return self.itar_files_cache[tar_file_id]
+        return GlobalTarHandleManager.get_instance().acquire(self, tar_file_id)
 
     @contextlib.contextmanager
     def _open_itarfile(self, tar_file_id: int) -> Generator[ITarFile, None, None]:
@@ -189,9 +180,67 @@ class ITarReader(ABC, Generic[T_index]):
         """
         Get a sample from the dataset or slice it.
 
+        Retries on OSError or truncated tar stream (``Unexpected end of tar
+        file``), evicting the stale handle before each retry so a fresh
+        connection is opened.
+
         Args:
             sample_pointer: The sample pointer to get the sample from.
-            sample_index: The global index of the sample in the dataset.
+            restore_index: The global index of the sample in the dataset.
+            entry_match_fn: An optional function to filter the entries in the sample.
+
+        Returns:
+            The sample or None if the sample is not found.
+        """
+        from megatron.energon.global_handle_manager import GlobalTarHandleManager
+
+        manager = GlobalTarHandleManager.get_instance()
+        max_retries = 3
+        last_exc = None
+        for attempt in range(max_retries + 1):
+            try:
+                return self._get_item_by_sample_pointer_inner(
+                    sample_pointer, restore_index, entry_match_fn
+                )
+            except (OSError, ValueError) as e:
+                # OSError: stale/broken S3 connection
+                # ValueError("Unexpected end of tar file"): truncated tar stream
+                if isinstance(e, ValueError) and "Unexpected end of tar file" not in str(e):
+                    raise
+                last_exc = e
+                tar_file_name = (
+                    self.tar_filenames[sample_pointer.tar_file_id]
+                    if sample_pointer.tar_file_id < len(self.tar_filenames)
+                    else "unknown"
+                )
+                if attempt < max_retries:
+                    manager.evict(id(self), sample_pointer.tar_file_id)
+                    wait = 0.5 * (2 ** attempt)
+                    logger.warning(
+                        f"[ITarReader] {type(e).__name__} reading sample {restore_index} "
+                        f"from {tar_file_name} (attempt {attempt + 1}/{max_retries + 1}): "
+                        f"{e}, retrying in {wait:.1f}s"
+                    )
+                    time.sleep(wait)
+                else:
+                    logger.error(
+                        f"[ITarReader] {type(e).__name__} reading sample {restore_index} "
+                        f"from {tar_file_name} after {max_retries + 1} attempts, re-raising"
+                    )
+        raise last_exc
+
+    def _get_item_by_sample_pointer_inner(
+        self,
+        sample_pointer: ITarSamplePointer,
+        restore_index: str | int,
+        entry_match_fn: Optional[Callable[[str], bool]] = None,
+    ) -> FilteredSample | None:
+        """
+        Core logic for reading a sample from the tar file.
+
+        Args:
+            sample_pointer: The sample pointer to get the sample from.
+            restore_index: The global index of the sample in the dataset.
             entry_match_fn: An optional function to filter the entries in the sample.
 
         Returns:

@@ -6,6 +6,10 @@ from typing import Optional, TypeVar
 from megatron.energon.cache import CachePool
 from megatron.energon.deprecation import warn_deprecated
 from megatron.energon.flavors import SavableDataset
+from megatron.energon.global_handle_manager import (
+    GlobalIdxHandleManager,
+    GlobalTarHandleManager,
+)
 from megatron.energon.savable_loader import BasicDataLoader, SavableDataLoader
 from megatron.energon.worker import WorkerConfig
 from megatron.energon.wrappers.gc_dataset import GC_DEFAULT_EVERY_N_ITER
@@ -26,6 +30,8 @@ def get_savable_loader(
     watchdog_timeout_seconds: Optional[float] = 60,
     watchdog_initial_timeout_seconds: Optional[float] = None,
     fail_on_timeout: bool = False,
+    max_tar_handles: int = 100,
+    max_idx_handles: int = 100,
 ) -> SavableDataLoader[T]:
     """
 
@@ -46,6 +52,8 @@ def get_savable_loader(
         watchdog_timeout_seconds: The timeout in seconds. If None, the watchdog is disabled.
         watchdog_initial_timeout_seconds: The initial timeout in seconds. If None, the timeout is the same as watchdog_timeout_seconds.
         fail_on_timeout: If True, stops the whole process upon timeout, after printing a stack trace.
+        max_tar_handles: Maximum number of open tar file handles per worker process.
+        max_idx_handles: Maximum number of open .tar.idx handles per worker process.
     Returns:
         The instantiated :class:`megatron.energon.SavableDataLoader`, yielding batches from the dataset,
         allowing to save the state of the dataset.
@@ -60,6 +68,9 @@ def get_savable_loader(
             warn_deprecated(
                 "Passing a worker_config to get_savable_loader() is deprecated and will have no effect."
             )
+
+    GlobalTarHandleManager.get_instance(max_handles=max_tar_handles)
+    GlobalIdxHandleManager.get_instance(max_handles=max_idx_handles)
 
     return SavableDataLoader(
         dataset,
