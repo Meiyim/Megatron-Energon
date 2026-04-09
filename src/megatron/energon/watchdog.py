@@ -27,7 +27,9 @@ PRINT_LOCAL_MAX_LENGTH = 250
 # Set via ENERGON_MEM_AVAIL_THRESHOLD_GB. Default 200 GB.
 _MEM_AVAIL_THRESHOLD_GB = float(os.environ.get("ENERGON_MEM_AVAIL_THRESHOLD_GB", "600"))
 # How often the daemon thread checks memory (seconds).
-_MEM_CHECK_INTERVAL = float(os.environ.get("ENERGON_MEM_CHECK_INTERVAL", "3600"))
+_MEM_CHECK_INTERVAL = float(os.environ.get("ENERGON_MEM_CHECK_INTERVAL", "60"))
+# Minimum seconds between consecutive memory dumps to avoid log spam.
+_MEM_DUMP_COOLDOWN = float(os.environ.get("ENERGON_MEM_DUMP_COOLDOWN", "300"))
 
 
 class Watchdog:
@@ -72,7 +74,7 @@ class Watchdog:
             self._deadline = None
 
         self._stop = False  # signals permanent shutdown (finish)
-        self._mem_dumped = False  # only dump once per watchdog instance
+        self._last_mem_dump: float = 0.0  # timestamp of last memory dump
 
         # Condition variable to manage state changes
         self._cv = threading.Condition()
@@ -99,20 +101,22 @@ class Watchdog:
                     return
 
                 # --- Memory check (runs every iteration, ~every _MEM_CHECK_INTERVAL seconds) ---
-                if not self._mem_dumped and _MEM_AVAIL_THRESHOLD_GB > 0:
+                if _MEM_AVAIL_THRESHOLD_GB > 0:
                     try:
-                        avail = get_mem_available_gb()
-                        rss = get_rss_gb()
-                        if avail < _MEM_AVAIL_THRESHOLD_GB:
-                            self._mem_dumped = True
-                            print(
-                                f"[MEM_WATCHDOG] pid={os.getpid()} MEMORY LOW: "
-                                f"avail={avail:.1f}G < threshold={_MEM_AVAIL_THRESHOLD_GB:.0f}G, "
-                                f"rss={rss:.1f}G  — dumping stacks & memory stats",
-                                flush=True,
-                            )
-                            self._print_all_thread_stacks(skip_thread_id=threading.get_ident())
-                            self._print_memory_stats()
+                        now = time.monotonic()
+                        if now - self._last_mem_dump >= _MEM_DUMP_COOLDOWN:
+                            avail = get_mem_available_gb()
+                            rss = get_rss_gb()
+                            if avail < _MEM_AVAIL_THRESHOLD_GB:
+                                self._last_mem_dump = now
+                                print(
+                                    f"[MEM_WATCHDOG] pid={os.getpid()} MEMORY LOW: "
+                                    f"avail={avail:.1f}G < threshold={_MEM_AVAIL_THRESHOLD_GB:.0f}G, "
+                                    f"rss={rss:.1f}G  — dumping stacks & memory stats",
+                                    flush=True,
+                                )
+                                self._print_all_thread_stacks(skip_thread_id=threading.get_ident())
+                                self._print_memory_stats()
                     except Exception:
                         pass
 

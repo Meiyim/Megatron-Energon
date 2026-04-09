@@ -61,14 +61,6 @@ def _init_worker(seed_per_worker: List[int], dp_rank: int, num_workers: int, wor
 
     SystemRng.seed(worker_seed)
 
-    # Stagger worker starts to avoid S3 request burst at init time.
-    # Without this, all workers simultaneously fill their shuffle/packing buffers,
-    # causing RequestRateLimitExceeded on the S3 bucket.
-    # Use global worker ID (across all DP ranks) for proper staggering.
-    global_worker_id = dp_rank * num_workers + worker_id
-    if global_worker_id > 0:
-        time.sleep(global_worker_id * 0.5)
-
 
 class SimpleSavableDatasetWrapper(BaseWrapperDataset[T, Tuple[int, int, T]], Generic[T]):
     """Wrapper for non-multiprocessing savable datasets. Restarts the inner dataset. This class is
