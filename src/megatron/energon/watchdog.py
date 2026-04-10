@@ -27,7 +27,9 @@ PRINT_LOCAL_MAX_LENGTH = 250
 # Set via ENERGON_MEM_AVAIL_THRESHOLD_GB. Default 200 GB.
 _MEM_AVAIL_THRESHOLD_GB = float(os.environ.get("ENERGON_MEM_AVAIL_THRESHOLD_GB", "600"))
 # How often the daemon thread checks memory (seconds).
-_MEM_CHECK_INTERVAL = float(os.environ.get("ENERGON_MEM_CHECK_INTERVAL", "3600"))
+_MEM_CHECK_INTERVAL = float(os.environ.get("ENERGON_MEM_CHECK_INTERVAL", "60"))
+# Minimum seconds between consecutive memory dumps to avoid log spam.
+_MEM_DUMP_COOLDOWN = float(os.environ.get("ENERGON_MEM_DUMP_COOLDOWN", "300"))
 
 
 class Watchdog:
@@ -72,7 +74,7 @@ class Watchdog:
             self._deadline = None
 
         self._stop = False  # signals permanent shutdown (finish)
-        self._mem_dumped = False  # only dump once per watchdog instance
+        self._last_mem_dump: float = 0.0  # timestamp of last memory dump
 
         # Condition variable to manage state changes
         self._cv = threading.Condition()
@@ -99,20 +101,22 @@ class Watchdog:
                     return
 
                 # --- Memory check (runs every iteration, ~every _MEM_CHECK_INTERVAL seconds) ---
-                if not self._mem_dumped and _MEM_AVAIL_THRESHOLD_GB > 0:
+                if _MEM_AVAIL_THRESHOLD_GB > 0:
                     try:
-                        avail = get_mem_available_gb()
-                        rss = get_rss_gb()
-                        if avail < _MEM_AVAIL_THRESHOLD_GB:
-                            self._mem_dumped = True
-                            print(
-                                f"[MEM_WATCHDOG] pid={os.getpid()} MEMORY LOW: "
-                                f"avail={avail:.1f}G < threshold={_MEM_AVAIL_THRESHOLD_GB:.0f}G, "
-                                f"rss={rss:.1f}G  — dumping stacks & memory stats",
-                                flush=True,
-                            )
-                            self._print_all_thread_stacks(skip_thread_id=threading.get_ident())
-                            self._print_memory_stats()
+                        now = time.monotonic()
+                        if now - self._last_mem_dump >= _MEM_DUMP_COOLDOWN:
+                            avail = get_mem_available_gb()
+                            rss = get_rss_gb()
+                            if avail < _MEM_AVAIL_THRESHOLD_GB:
+                                self._last_mem_dump = now
+                                print(
+                                    f"[MEM_WATCHDOG] pid={os.getpid()} MEMORY LOW: "
+                                    f"avail={avail:.1f}G < threshold={_MEM_AVAIL_THRESHOLD_GB:.0f}G, "
+                                    f"rss={rss:.1f}G  — dumping stacks & memory stats",
+                                    flush=True,
+                                )
+                                self._print_all_thread_stacks(skip_thread_id=threading.get_ident())
+                                self._print_memory_stats()
                     except Exception:
                         pass
 
@@ -225,6 +229,142 @@ class Watchdog:
             lines.append(f"  Open FDs: {fd_count}")
         except Exception:
             pass
+
+        # 8) /proc/self/smaps_rollup — anonymous vs file-backed RSS
+        try:
+            with open("/proc/self/smaps_rollup") as f:
+                for line in f:
+                    if line.startswith(("Rss:", "Anonymous:", "LazyFree:", "Shared", "Private")):
+                        lines.append(f"  smaps: {line.rstrip()}")
+        except Exception:
+            pass
+
+        # 9) glibc malloc arena stats via mallinfo2 (if available)
+        try:
+            import ctypes
+            _libc = ctypes.CDLL("libc.so.6")
+
+            class _Mallinfo2(ctypes.Structure):
+                _fields_ = [
+                    ("arena", ctypes.c_size_t),      # non-mmapped space allocated from system
+                    ("ordblks", ctypes.c_size_t),     # number of free chunks
+                    ("smblks", ctypes.c_size_t),      # number of fastbin blocks
+                    ("hblks", ctypes.c_size_t),       # number of mmapped regions
+                    ("hblkhd", ctypes.c_size_t),      # space in mmapped regions
+                    ("usmblks", ctypes.c_size_t),     # always 0
+                    ("fsmblks", ctypes.c_size_t),     # space available in freed fastbin blocks
+                    ("uordblks", ctypes.c_size_t),    # total allocated space
+                    ("fordblks", ctypes.c_size_t),    # total free space
+                    ("keepcost", ctypes.c_size_t),    # releasable space (via malloc_trim)
+                ]
+
+            _libc.mallinfo2.restype = _Mallinfo2
+            mi = _libc.mallinfo2()
+            lines.append(
+                f"  malloc: arena={mi.arena / (1024**2):.0f}MB "
+                f"used={mi.uordblks / (1024**2):.0f}MB "
+                f"free={mi.fordblks / (1024**2):.0f}MB "
+                f"mmap={mi.hblkhd / (1024**2):.0f}MB "
+                f"releasable={mi.keepcost / (1024**2):.0f}MB"
+            )
+        except Exception:
+            pass
+
+        # 10) Checkpoint ring-buffer stats (_last_checkpoints in SavableDatasetWrapper)
+        try:
+            import collections as _collections
+            from megatron.energon.savable_loader import SavableDatasetWrapper
+            wrappers = [o for o in gc.get_objects() if isinstance(o, SavableDatasetWrapper)]
+            for w in wrappers:
+                cp_list = getattr(w, "_last_checkpoints", [])
+                n_cp = len(cp_list)
+                max_cp = getattr(w, "n_checkpoints", "?")
+                worker_id = getattr(w, "_worker_id", "?")
+                # Measure total size of checkpoint states via sys.getsizeof (shallow)
+                cp_shallow = sum(sys.getsizeof(cp) for cp in cp_list)
+                # Count FlexState objects reachable from checkpoints
+                flex_count = 0
+                restore_key_total = 0
+                for cp in cp_list:
+                    state = getattr(cp, "state", None)
+                    if state is None:
+                        continue
+                    ds_state = getattr(state, "dataset_state", None)
+                    if ds_state is None:
+                        continue
+                    _stack = [ds_state]
+                    while _stack:
+                        obj = _stack.pop()
+                        if type(obj).__name__ == "FlexState":
+                            flex_count += 1
+                            for v in obj.values():
+                                _stack.append(v)
+                        elif isinstance(obj, list):
+                            for item in obj:
+                                _stack.append(item)
+                        elif type(obj).__name__ == "SliceState":
+                            pass
+                        # check for _restore_keys (lists of tuples)
+                        if isinstance(obj, dict) and "_restore_keys" in obj:
+                            rk = obj["_restore_keys"]
+                            if isinstance(rk, list):
+                                restore_key_total += len(rk)
+                lines.append(
+                    f"  checkpoint_ring[worker={worker_id}]: "
+                    f"{n_cp}/{max_cp} snapshots, "
+                    f"flex={flex_count}, restore_keys_total={restore_key_total}, "
+                    f"shallow_bytes={cp_shallow}"
+                )
+        except Exception as e:
+            lines.append(f"  checkpoint_ring: <error: {e}>")
+
+        # 11) Deep size estimate of _last_checkpoints via recursive sys.getsizeof
+        try:
+            from megatron.energon.savable_loader import SavableDatasetWrapper
+            wrappers = [o for o in gc.get_objects() if isinstance(o, SavableDatasetWrapper)]
+            for w in wrappers:
+                cp_list = getattr(w, "_last_checkpoints", [])
+                if not cp_list:
+                    continue
+                worker_id = getattr(w, "_worker_id", "?")
+                # BFS deep size (capped at 500k objects to avoid hang)
+                seen = set()
+                total_size = 0
+                queue = list(cp_list)
+                max_visit = 500_000
+                visited = 0
+                while queue and visited < max_visit:
+                    obj = queue.pop()
+                    obj_id = id(obj)
+                    if obj_id in seen:
+                        continue
+                    seen.add(obj_id)
+                    visited += 1
+                    try:
+                        total_size += sys.getsizeof(obj)
+                    except Exception:
+                        continue
+                    # Traverse into containers
+                    if isinstance(obj, dict):
+                        queue.extend(obj.values())
+                        queue.extend(obj.keys())
+                    elif isinstance(obj, (list, tuple)):
+                        queue.extend(obj)
+                    elif hasattr(obj, "__dict__"):
+                        queue.extend(obj.__dict__.values())
+                    elif hasattr(obj, "__slots__"):
+                        for slot in obj.__slots__:
+                            try:
+                                queue.append(getattr(obj, slot))
+                            except AttributeError:
+                                pass
+                lines.append(
+                    f"  checkpoint_deep_size[worker={worker_id}]: "
+                    f"{total_size / (1024**2):.1f}MB "
+                    f"(visited {visited} objects, capped={visited >= max_visit})"
+                )
+        except Exception as e:
+            lines.append(f"  checkpoint_deep_size: <error: {e}>")
 
         lines.append("=" * 60)
         report = "\n".join(lines)
