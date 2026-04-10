@@ -1,9 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import logging
+import time
 from typing import Any, Dict, Generator, Iterator, List, Optional, Sequence, Tuple, Union
 
 import torch
+
+_logger = logging.getLogger(__name__)
 
 from megatron.energon.edataclass import edataclass
 from megatron.energon.flavors.base_dataset import FlexState, SavableDataset
@@ -140,10 +144,25 @@ class WebdatasetSampleLoaderDataset(SavableDataset[RawSampleData]):
             self.slice_offsets = self.workers_slice_offsets[self.worker_config.rank_worker_id()]
 
     def _get_sample(self, index: int) -> RawSampleData:
-        return RawSampleData(
-            __restore_key__=("Webdataset", index),
-            data=tuple(reader[index] for reader in self.join_readers),
-        )
+        max_retries = 3
+        for attempt in range(max_retries + 1):
+            try:
+                data = []
+                for reader in self.join_readers:
+                    data.append(reader[index])
+                return RawSampleData(
+                    __restore_key__=("Webdataset", index),
+                    data=tuple(data),
+                )
+            except (SystemError, RuntimeError, OSError, Exception) as e:
+                if attempt >= max_retries:
+                    raise
+                wait = min(1.0 * (2 ** attempt), 8.0)
+                _logger.warning(
+                    f"[SAMPLE_READ] {type(e).__name__} reading index={index}, "
+                    f"retry {attempt + 1}/{max_retries} in {wait:.1f}s: {e}"
+                )
+                time.sleep(wait)
 
     def _slices_once(self) -> List[int]:
         """Yields the indexes to slice offsets once. Possibly shuffles the list."""

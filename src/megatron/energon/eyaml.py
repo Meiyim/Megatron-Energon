@@ -7,6 +7,7 @@ from typing import Any, BinaryIO, Union
 import ryml
 
 from megatron.energon.epathlib.epath import EPath
+from megatron.energon.metadata_cache import metadata_cache
 
 
 def load_yaml_json(path: EPath) -> Any:
@@ -18,14 +19,21 @@ def load_yaml_json(path: EPath) -> Any:
     Returns:
         The parsed YAML or JSON data as a native Python object.
     """
+    cached, hit = metadata_cache.get("yaml_json", str(path))
+    if hit:
+        return cached
+
     if path.name.endswith(".yaml"):
         with path.open("rb") as f:
-            return load_yaml(f)
+            result = load_yaml(f)
     elif path.name.endswith(".json"):
         with path.open("rb") as f:
-            return json.load(f)
+            result = json.load(f)
     else:
         raise ValueError(f"Invalid file extension: {path.name}")
+
+    metadata_cache.put("yaml_json", str(path), result)
+    return result
 
 
 def load_yaml(stream: Union[BinaryIO, bytes]) -> Any:

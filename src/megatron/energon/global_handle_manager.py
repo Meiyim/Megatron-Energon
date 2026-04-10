@@ -337,6 +337,7 @@ def _patch_s3_fork_safety():
 
     try:
         from multistorageclient.providers.s3 import S3StorageProvider
+        from multistorageclient.types import RetryableError
     except ImportError:
         logger.warning("[S3_FORK_SAFETY] multistorageclient not available, skipping")
         return
@@ -393,13 +394,17 @@ def _patch_s3_fork_safety():
         for attempt in range(max_retries + 1):
             try:
                 return _orig_translate(self, func, operation, bucket, key)
-            except RuntimeError as e:
+            except (RuntimeError, RetryableError) as e:
                 err_msg = str(e)
-                is_rate_limit = any(
+                is_retryable = isinstance(e, RetryableError) or any(
                     kw in err_msg
-                    for kw in ("SlowDown", "429", "503", "RateLimitExceeded", "RequestRateLimitExceeded", "Throttl", "TooManyRequest")
+                    for kw in (
+                        "SlowDown", "429", "503", "RateLimitExceeded",
+                        "RequestRateLimitExceeded", "Throttl", "TooManyRequest",
+                        "Failed to GET", "Failed to PUT",
+                    )
                 )
-                if not is_rate_limit or attempt >= max_retries:
+                if not is_retryable or attempt >= max_retries:
                     raise
                 wait = min(1.0 * (2 ** attempt), 30.0)
                 logger.warning(

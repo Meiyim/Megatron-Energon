@@ -22,6 +22,7 @@ from megatron.energon.flavors.webdataset.structs import (
     WebdatasetInfo,
     WebdatasetSplits,
 )
+from megatron.energon.metadata_cache import metadata_cache
 from megatron.energon.typed_converter import JsonParser
 
 
@@ -125,6 +126,9 @@ def get_dataset_info(path: EPath) -> dict:
     """Given the path to an energon webdataset that contains a .nv-meta folder,
     return the dataset info as a dict.
     """
+    cached, hit = metadata_cache.get("dataset_info", str(path))
+    if hit:
+        return cached
 
     info_config = path / MAIN_FOLDER_NAME / INFO_JSON_FILENAME
     # YAML for backwards compatibility
@@ -132,20 +136,28 @@ def get_dataset_info(path: EPath) -> dict:
 
     if info_config.is_file():
         with info_config.open("r") as rf:
-            return json.load(rf)
+            result = json.load(rf)
     elif yaml_info_config.is_file():
-        return load_yaml(yaml_info_config.read_bytes())
+        result = load_yaml(yaml_info_config.read_bytes())
     else:
         raise ValueError(f"No info config file found at {info_config} or {yaml_info_config}")
+
+    metadata_cache.put("dataset_info", str(path), result)
+    return result
 
 
 def check_dataset_info_present(path: EPath) -> bool:
     """Given the path to an energon webdataset that contains a .nv-meta folder,
     return True if the dataset info is present, False otherwise.
     """
-    return (path / MAIN_FOLDER_NAME / INFO_JSON_FILENAME).is_file() or (
+    cached, hit = metadata_cache.get("info_present", str(path))
+    if hit:
+        return cached
+    result = (path / MAIN_FOLDER_NAME / INFO_JSON_FILENAME).is_file() or (
         path / MAIN_FOLDER_NAME / INFO_YAML_FILENAME
     ).is_file()
+    metadata_cache.put("info_present", str(path), result)
+    return result
 
 
 def get_dataset_type(path: EPath) -> EnergonDatasetType:
@@ -157,20 +169,27 @@ def get_dataset_type(path: EPath) -> EnergonDatasetType:
     Returns:
         The type of the dataset.
     """
+    cached, hit = metadata_cache.get("dataset_type", str(path))
+    if hit:
+        return cached
+
     metadata_db = path / MAIN_FOLDER_NAME / INDEX_SQLITE_FILENAME
 
     if path.is_file():
         if path.name.endswith(".jsonl"):
-            return EnergonDatasetType.JSONL
+            result = EnergonDatasetType.JSONL
         elif path.name.endswith(".yaml"):
-            return EnergonDatasetType.METADATASET
+            result = EnergonDatasetType.METADATASET
         else:
-            return EnergonDatasetType.INVALID
+            result = EnergonDatasetType.INVALID
     elif check_dataset_info_present(path):
-        return EnergonDatasetType.WEBDATASET
+        result = EnergonDatasetType.WEBDATASET
     elif metadata_db.is_file():
         # There is an sqlite, but no .info.json or .info.yaml,
         # so it's a filesystem dataset
-        return EnergonDatasetType.FILESYSTEM
+        result = EnergonDatasetType.FILESYSTEM
     else:
-        return EnergonDatasetType.INVALID
+        result = EnergonDatasetType.INVALID
+
+    metadata_cache.put("dataset_type", str(path), result)
+    return result

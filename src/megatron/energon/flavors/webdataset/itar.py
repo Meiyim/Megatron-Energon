@@ -5,6 +5,7 @@ import contextlib
 import logging
 import struct
 import tarfile
+import time
 from types import TracebackType
 from typing import BinaryIO, Dict, Generator, Optional, Tuple, Type, Union
 
@@ -59,10 +60,22 @@ class TarIndexReader:
         if index >= self._length or index < 0:
             raise IndexError(f"Index {index} out of range")
 
-        if self.itar.tell() != 8 * index:
-            self.itar.seek(8 * index)
-
-        return struct.unpack("Q", self.itar.read(8))[0]
+        max_retries = 3
+        for attempt in range(max_retries + 1):
+            if self.itar.tell() != 8 * index:
+                self.itar.seek(8 * index)
+            try:
+                data = self.itar.read(8)
+                return struct.unpack("Q", data)[0]
+            except struct.error:
+                if attempt >= max_retries:
+                    raise
+                wait = min(1.0 * (2 ** attempt), 8.0)
+                logger.warning(
+                    f"[IDX_READ] struct.error at index={index}, "
+                    f"retry {attempt + 1}/{max_retries} in {wait:.1f}s"
+                )
+                time.sleep(wait)
 
     def __iter__(self) -> Generator[int, None, None]:
         self.itar.seek(0)

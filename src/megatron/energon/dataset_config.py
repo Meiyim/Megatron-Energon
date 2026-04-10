@@ -14,6 +14,7 @@ from megatron.energon.flavors import (
 )
 from megatron.energon.flavors.webdataset.config import MAIN_FOLDER_NAME
 from megatron.energon.flavors.webdataset.metadata import EnergonDatasetType, get_dataset_type
+from megatron.energon.metadata_cache import metadata_cache
 from megatron.energon.typed_converter import JsonParser
 from megatron.energon.worker import WorkerConfig
 
@@ -41,9 +42,14 @@ def load_config(
     if isinstance(path, dict):
         data = path
     else:
-        # Read the config from a file
-        with path.open("rb") as f:
-            data: dict = load_yaml(f)
+        # Check cache for the raw YAML dict
+        cached, hit = metadata_cache.get("load_config", str(path))
+        if hit:
+            data = cached
+        else:
+            with path.open("rb") as f:
+                data: dict = load_yaml(f)
+            metadata_cache.put("load_config", str(path), data)
 
     if default_kwargs is not None:
         new_data = default_kwargs.copy()
