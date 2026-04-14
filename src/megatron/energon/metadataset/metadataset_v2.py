@@ -1,7 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import logging
+import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Type, Union
 
@@ -26,6 +30,9 @@ from megatron.energon.metadataset.loader_interface import (
 )
 from megatron.energon.metadataset.metadataset import Metadataset
 from megatron.energon.worker import WorkerConfig
+
+_logger = logging.getLogger(__name__)
+_ENERGON_IO_WORKERS = int(os.environ.get("ENERGON_IO_WORKERS", 0))
 
 # Regex for any URL-like string (any protocol)
 url_regex = re.compile(r"^(?P<protocol>[a-z][a-z0-9+.-]*)://(?P<path>.*)", re.IGNORECASE)
@@ -435,8 +442,26 @@ class MetadatasetBlend(DatasetLoaderInterface, SubsetRatioMixin):
 
     def post_initialize(self, mds_path: Optional[EPath] = None):
         assert mds_path is not None
-        for dataset in self.blend:
-            dataset.post_initialize(mds_path)
+        n_workers = _ENERGON_IO_WORKERS
+        if n_workers > 1 and len(self.blend) > 1:
+            t0 = time.monotonic()
+            with ThreadPoolExecutor(max_workers=min(n_workers, len(self.blend))) as pool:
+                futs = {pool.submit(ds.post_initialize, mds_path): ds for ds in self.blend}
+                for fut in as_completed(futs):
+                    fut.result()
+            _logger.info(
+                f"[ENERGON] MetadatasetBlend.post_initialize: "
+                f"{len(self.blend)} datasets in {time.monotonic() - t0:.2f}s "
+                f"(threaded, workers={min(n_workers, len(self.blend))})"
+            )
+        else:
+            t0 = time.monotonic()
+            for i, dataset in enumerate(self.blend):
+                dataset.post_initialize(mds_path)
+            _logger.info(
+                f"[ENERGON] MetadatasetBlend.post_initialize: "
+                f"{len(self.blend)} datasets in {time.monotonic() - t0:.2f}s (sequential)"
+            )
 
     def prepare(self, split_part: Optional[str] = None) -> Sequence[EPath]:
         files = []
@@ -457,9 +482,9 @@ class MetadatasetBlend(DatasetLoaderInterface, SubsetRatioMixin):
     ) -> LoadedDatasetList:
         subset = self._get_subset(subset)
         sum_weight = sum(dataset.weight for dataset in self.blend)
-        datasets = []
-        for dataset in self.blend:
-            inner_result = dataset.get_datasets(
+
+        def _load_one(idx, dataset):
+            return dataset, dataset.get_datasets(
                 training=training,
                 split_part=split_part,
                 worker_config=worker_config,
@@ -468,6 +493,28 @@ class MetadatasetBlend(DatasetLoaderInterface, SubsetRatioMixin):
                 subset=subset,
                 **kwargs,
             )
+
+        n_workers = _ENERGON_IO_WORKERS
+        if n_workers > 1 and len(self.blend) > 1:
+            t0 = time.monotonic()
+            with ThreadPoolExecutor(max_workers=min(n_workers, len(self.blend))) as pool:
+                futs = [pool.submit(_load_one, i, ds) for i, ds in enumerate(self.blend)]
+                results = [f.result() for f in futs]
+            _logger.info(
+                f"[ENERGON] MetadatasetBlend.get_datasets: "
+                f"{len(self.blend)} datasets in {time.monotonic() - t0:.2f}s "
+                f"(threaded, workers={min(n_workers, len(self.blend))})"
+            )
+        else:
+            t0 = time.monotonic()
+            results = [_load_one(i, ds) for i, ds in enumerate(self.blend)]
+            _logger.info(
+                f"[ENERGON] MetadatasetBlend.get_datasets: "
+                f"{len(self.blend)} datasets in {time.monotonic() - t0:.2f}s (sequential)"
+            )
+
+        datasets = []
+        for dataset, inner_result in results:
             if inner_result.blend_mode not in (
                 DatasetBlendMode.NONE,
                 DatasetBlendMode.DATASET_WEIGHT,
