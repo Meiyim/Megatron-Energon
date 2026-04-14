@@ -4,6 +4,7 @@
 import contextlib
 import inspect
 import logging
+import os
 from typing import (
     Any,
     Callable,
@@ -195,7 +196,11 @@ class PackingDataset(
         if log_progress:
             import tqdm
 
-            pbar_ctx = pbar = tqdm.tqdm(total=self.buffer_size, desc="Filling reading buffer")
+            pbar_ctx = pbar = tqdm.tqdm(
+                total=self.buffer_size,
+                desc="Filling reading buffer",
+                disable=os.environ.get("ENERGON_DISABLE_PROGRESS", "0") == "1",
+            )
         else:
             pbar_ctx = contextlib.nullcontext()
             pbar = None

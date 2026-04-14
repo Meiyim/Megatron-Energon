@@ -1,6 +1,8 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import logging
+import time
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Tuple, TypeVar, Union
 
@@ -154,7 +156,11 @@ def get_train_dataset(
         The dataloader.
     """
 
+    _logger = logging.getLogger(__name__)
+
+    t0 = time.monotonic()
     loader = load_dataset(path, **_split_kwargs(kwargs))
+    t1 = time.monotonic()
     _split_deprecated_dataset_kwargs(kwargs, task_encoder, worker_config)
 
     datasets = loader.get_datasets(
@@ -165,6 +171,14 @@ def get_train_dataset(
         shuffle_over_epochs_multiplier=shuffle_over_epochs_multiplier,
         decoder=task_encoder.decoder,
         **kwargs,
+    )
+    t2 = time.monotonic()
+    _logger.info(
+        f"[ENERGON] get_train_dataset timing: "
+        f"phase1_load_dataset={t1 - t0:.2f}s (get_dataset_type + post_initialize), "
+        f"phase2_get_datasets={t2 - t1:.2f}s (build all leaf datasets), "
+        f"total={t2 - t0:.2f}s, "
+        f"n_datasets={len(datasets.datasets)}"
     )
     return task_encoder.build_train_datasets(
         datasets=datasets.datasets,
