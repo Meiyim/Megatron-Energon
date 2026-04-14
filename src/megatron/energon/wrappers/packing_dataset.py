@@ -4,6 +4,7 @@
 import contextlib
 import inspect
 import logging
+import os
 from typing import (
     Any,
     Callable,
@@ -195,7 +196,11 @@ class PackingDataset(
         if log_progress:
             import tqdm
 
-            pbar_ctx = pbar = tqdm.tqdm(total=self.buffer_size, desc="Filling reading buffer")
+            pbar_ctx = pbar = tqdm.tqdm(
+                total=self.buffer_size,
+                desc="Filling reading buffer",
+                disable=os.environ.get("ENERGON_DISABLE_PROGRESS", "0") == "1",
+            )
         else:
             pbar_ctx = contextlib.nullcontext()
             pbar = None
@@ -240,7 +245,7 @@ class PackingDataset(
         self._pre_packing_buffer.worker_start()
         self._reading_buffer.worker_start()
 
-        is_initial_pack = True
+        is_initial_pack = False
 
         def encode_pack_samples(pack: List[T_sample]) -> List[T_encoded_sample]:
             """Encode the samples in the pack using the sample encoder."""

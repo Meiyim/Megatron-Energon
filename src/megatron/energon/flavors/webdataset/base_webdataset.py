@@ -142,7 +142,7 @@ class BaseWebdatasetFactory(
             subset=self.subset,
         )
         if DEBUG_SHARD_PRINT:
-            _print_shard_slices(self.worker_config, self.shards, workers_sample_slice_offsets)
+            _print_shard_slices(self.worker_config, self.shards, workers_sample_slice_offsets, self.path)
 
         itar_reader = ShardInfosITarReader(
             self.path,
@@ -210,7 +210,7 @@ class BaseWebdatasetFactory(
 
 
 def _print_shard_slices(
-    worker_config: WorkerConfig, shards: List[ShardInfo], slice_offsets: Sequence[Sequence[int]]
+    worker_config: WorkerConfig, shards: List[ShardInfo], slice_offsets: Sequence[Sequence[int]], dataset_path: EPath
 ):
     shard_starts = np.cumsum([0] + [shard.count for shard in shards])
 
@@ -268,6 +268,6 @@ def _print_shard_slices(
             )
 
         print(
-            f"rank={worker_config.rank}, worker={worker_idx}: sample_range=[{start_idx}, {end_idx}] in {len(sample_slice_offsets) - 1} slices, "
+            f"dataset={dataset_path}, rank={worker_config.rank}, worker={worker_idx}: sample_range=[{start_idx}, {end_idx}] in {len(sample_slice_offsets) - 1} slices, "
             f"sum(count)={end_idx - start_idx}: indexes=[{offset_str}] slices=[{slices_str}]"
         )
