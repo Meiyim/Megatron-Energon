@@ -1,6 +1,10 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.
 # SPDX-License-Identifier: BSD-3-Clause
 
+import logging
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from megatron.energon.dataset_config import load_config
@@ -105,6 +109,11 @@ class DatasetReference:
         )
 
 
+_logger = logging.getLogger(__name__)
+
+_ENERGON_IO_WORKERS = int(os.environ.get("ENERGON_IO_WORKERS", 0))
+
+
 @edataclass
 class MetadatasetBlender:
     """Internal blending of the dataset."""
@@ -113,8 +122,26 @@ class MetadatasetBlender:
 
     def post_initialize(self, mds_path: Optional[EPath] = None):
         assert mds_path is not None
-        for dataset in self.datasets:
-            dataset.post_initialize(mds_path)
+        n_workers = _ENERGON_IO_WORKERS
+        if n_workers > 1 and len(self.datasets) > 1:
+            t0 = time.monotonic()
+            with ThreadPoolExecutor(max_workers=min(n_workers, len(self.datasets))) as pool:
+                futs = {pool.submit(ds.post_initialize, mds_path): ds for ds in self.datasets}
+                for fut in as_completed(futs):
+                    fut.result()  # propagate exceptions
+            _logger.info(
+                f"[ENERGON] MetadatasetBlender.post_initialize: "
+                f"{len(self.datasets)} datasets in {time.monotonic() - t0:.2f}s "
+                f"(threaded, workers={min(n_workers, len(self.datasets))})"
+            )
+        else:
+            t0 = time.monotonic()
+            for dataset in self.datasets:
+                dataset.post_initialize(mds_path)
+            _logger.info(
+                f"[ENERGON] MetadatasetBlender.post_initialize: "
+                f"{len(self.datasets)} datasets in {time.monotonic() - t0:.2f}s (sequential)"
+            )
 
     def get_datasets(
         self,
@@ -128,9 +155,9 @@ class MetadatasetBlender:
         **kwargs,
     ) -> LoadedDatasetList:
         sum_weight = sum(dataset.weight for dataset in self.datasets)
-        datasets = []
-        for dataset in self.datasets:
-            inner_result = dataset.get_datasets(
+
+        def _load_one(dataset):
+            return dataset, dataset.get_datasets(
                 training=training,
                 split_part=split_part,
                 worker_config=worker_config,
@@ -139,6 +166,30 @@ class MetadatasetBlender:
                 subset=subset,
                 **kwargs,
             )
+
+        n_workers = _ENERGON_IO_WORKERS
+        if n_workers > 1 and len(self.datasets) > 1:
+            t0 = time.monotonic()
+            results = []
+            with ThreadPoolExecutor(max_workers=min(n_workers, len(self.datasets))) as pool:
+                futs = [pool.submit(_load_one, ds) for ds in self.datasets]
+                # preserve order to keep deterministic blending
+                results = [f.result() for f in futs]
+            _logger.info(
+                f"[ENERGON] MetadatasetBlender.get_datasets: "
+                f"{len(self.datasets)} datasets in {time.monotonic() - t0:.2f}s "
+                f"(threaded, workers={min(n_workers, len(self.datasets))})"
+            )
+        else:
+            t0 = time.monotonic()
+            results = [_load_one(ds) for ds in self.datasets]
+            _logger.info(
+                f"[ENERGON] MetadatasetBlender.get_datasets: "
+                f"{len(self.datasets)} datasets in {time.monotonic() - t0:.2f}s (sequential)"
+            )
+
+        datasets = []
+        for dataset, inner_result in results:
             if inner_result.blend_mode not in (
                 DatasetBlendMode.NONE,
                 DatasetBlendMode.DATASET_WEIGHT,
