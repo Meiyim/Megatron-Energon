@@ -3,6 +3,7 @@
 
 import contextlib
 import logging
+import os
 import time
 from abc import ABC, abstractmethod
 from bisect import bisect_right
@@ -136,7 +137,7 @@ class ITarReader(ABC, Generic[T_index]):
 
         # Open a fresh tar file handle for this access. This avoids sharing file positions
         # and tarfile internal state across threads.
-        with self.tar_filepaths[tar_file_id].open(mode="rb") as file_object:
+        with self.tar_filepaths[tar_file_id].open(mode="rb", prefetch_file=True) as file_object:
             with ITarFile.open(fileobj=file_object, mode="r:") as tar_file:
                 yield tar_file
 
@@ -225,9 +226,12 @@ class ITarReader(ABC, Generic[T_index]):
                 else:
                     logger.error(
                         f"[ITarReader] {type(e).__name__} reading sample {restore_index} "
-                        f"from {tar_file_name} after {max_retries + 1} attempts, re-raising"
+                        f"from {tar_file_name} after {max_retries + 1} attempts, skipping sample"
                     )
-        raise last_exc
+        from megatron.energon.errors import SkipSample
+        raise SkipSample(
+            f"Skipping sample {restore_index} after {max_retries + 1} failed attempts: {last_exc}"
+        ) from last_exc
 
     def _get_item_by_sample_pointer_inner(
         self,
@@ -320,8 +324,22 @@ class ITarReader(ABC, Generic[T_index]):
         Get a sample from the dataset or slice it.
         """
         assert isinstance(idx, int), f"Invalid argument type for __getitem__: {type(idx)}"
+        if not os.environ.get("ENERGON_S3_PERF_LOG"):
+            sample_pointer = self._get_itar_sample_pointer(idx)
+            return self._get_item_by_sample_pointer(sample_pointer, idx)
+
+        t0 = time.perf_counter()
         sample_pointer = self._get_itar_sample_pointer(idx)
-        return self._get_item_by_sample_pointer(sample_pointer, idx)
+        t1 = time.perf_counter()
+        result = self._get_item_by_sample_pointer(sample_pointer, idx)
+        t2 = time.perf_counter()
+        shard = self.tar_filenames[sample_pointer.tar_file_id] if sample_pointer.tar_file_id < len(self.tar_filenames) else "?"
+        print(
+            f"[S3_PERF] pid={os.getpid()} idx={idx} shard={shard} "
+            f"idx_ms={1000*(t1-t0):.1f} tar_ms={1000*(t2-t1):.1f} total_ms={1000*(t2-t0):.1f}",
+            flush=True,
+        )
+        return result
 
 
 class JoinIndexFileITarReader(ITarReader[int]):

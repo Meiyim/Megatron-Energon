@@ -111,7 +111,7 @@ class GlobalTarHandleManager:
 
     def _open_tar_file(self, reader: "ITarReader", tar_file_id: int) -> "ITarFile":
         from megatron.energon.flavors.webdataset.itar import ITarFile
-        file_object = reader.tar_filepaths[tar_file_id].open(mode="rb")
+        file_object = reader.tar_filepaths[tar_file_id].open(mode="rb", prefetch_file=True)
         return ITarFile.open(fileobj=file_object, mode="r:")
 
     def evict(self, reader_id: int, tar_file_id: int) -> bool:
@@ -153,7 +153,7 @@ class GlobalTarHandleManager:
                 if self.total_accesses > 0 else 0
             )
             logger.info(
-                f"[GlobalTarHandleManager] "
+                f"[GlobalTarHandleManager] pid={os.getpid()} "
                 f"handles={len(self.handles)}/{self.max_handles}, "
                 f"accesses={self.total_accesses}, "
                 f"opens={self.total_opens}, "
@@ -267,7 +267,7 @@ class GlobalIdxHandleManager:
                 if self.total_accesses > 0 else 0
             )
             logger.info(
-                f"[GlobalIdxHandleManager] "
+                f"[GlobalIdxHandleManager] pid={os.getpid()} "
                 f"handles={len(self.handles)}/{self.max_handles}, "
                 f"accesses={self.total_accesses}, "
                 f"opens={self.total_opens}, "
