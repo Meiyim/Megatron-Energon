@@ -216,7 +216,9 @@ class PackingDataset(
                         pbar.update(1)
                 except StopIteration:
                     return False
-                except SkipSample as e:
+                except (SkipSample, ValueError) as e:
+                    if isinstance(e, ValueError) and "Unexpected end of tar file" not in str(e):
+                        raise
                     consecutive_skip_count += 1
                     if consecutive_skip_count <= 10 or consecutive_skip_count % 100 == 0:
                         logger.warning(
