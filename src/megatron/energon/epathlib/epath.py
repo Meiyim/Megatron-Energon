@@ -212,18 +212,45 @@ class EPath:
         return self.fs.is_file(self._internal_str_path)
 
     def mkdir(self, exist_ok: bool = True, parents: bool = False):
-        pass
+        if self.is_local():
+            PathlibPath(self._internal_str_path).mkdir(exist_ok=exist_ok, parents=True)
 
     def glob(self, pattern) -> Generator["EPath", None, None]:
+        import fnmatch
         search_path_pattern = (self / pattern)._internal_str_path
 
-        for path in self.fs.glob(search_path_pattern):
-            assert isinstance(path, str)
+        # Try native glob first (works for local/POSIX paths)
+        results = list(self.fs.glob(search_path_pattern))
+        if results or self.is_local():
+            for path in results:
+                assert isinstance(path, str)
+                new_path = EPath(self)
+                new_path.internal_path = self._resolve(self.internal_path / PurePosixPath(path))
+                yield new_path
+            return
 
-            new_path = EPath(self)
-            new_path.internal_path = self._resolve(self.internal_path / PurePosixPath(path))
-
-            yield new_path
+        # Fallback for MSC S3 paths: use list_recursive + fnmatch
+        # Strip leading '/' from internal path for MSC prefix
+        prefix = self._internal_str_path.lstrip("/")
+        pat = pattern.replace("**/", "").replace("**", "")  # simplify for flat S3
+        try:
+            for obj in self.fs.list_recursive(prefix):
+                name = PurePosixPath(obj.key).name
+                if fnmatch.fnmatch(name, pat.lstrip("/")):
+                    new_path = EPath(self)
+                    new_path.internal_path = self._resolve(
+                        PurePosixPath("/" + obj.key)
+                    )
+                    yield new_path
+        except Exception:
+            for obj in self.fs.list(prefix):
+                name = PurePosixPath(obj.key).name
+                if fnmatch.fnmatch(name, pat.lstrip("/")):
+                    new_path = EPath(self)
+                    new_path.internal_path = self._resolve(
+                        PurePosixPath("/" + obj.key)
+                    )
+                    yield new_path
 
     def size(self) -> int:
         return self.fs.info(self._internal_str_path).content_length

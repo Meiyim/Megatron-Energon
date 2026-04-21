@@ -4,6 +4,7 @@
 import concurrent.futures
 import multiprocessing as mp
 import re
+import tempfile
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,6 +56,13 @@ class DatasetScanResult:
     compatible: bool
     duplicates: Dict[str, List[str]]
     scan_results: Dict[str, TarScanResult]
+    members_by_tar: Dict[str, list]  # tar_file -> pre-collected member dicts (msc:// only)
+
+    def __init__(self, compatible, duplicates, scan_results, members_by_tar=None):
+        self.compatible = compatible
+        self.duplicates = duplicates
+        self.scan_results = scan_results
+        self.members_by_tar = members_by_tar or {}
 
     @property
     def has_duplicates(self) -> bool:
@@ -478,7 +486,7 @@ class TarPatcher:
         self._show_progress = show_progress
 
     def dataset_scan(
-        self, tar_files: Sequence[str], parent_path: EPath, num_workers: int = NUM_WORKERS
+        self, tar_files: Sequence[str], parent_path: EPath, num_workers: int = NUM_WORKERS,
     ) -> DatasetScanResult:
         """Scan multiple tar files, checking compatibility for in-place renaming and for duplicate sample keys.
         Each tar_file string must be a relative or absolute path to a tar file.
@@ -488,10 +496,11 @@ class TarPatcher:
             parent_path: Parent path of the tar files, used if tar_files are relative paths.
 
         Returns:
-            DatasetScanResult: Result of the scan.
+            DatasetScanResult: Result of the scan, with members_data dict populated for msc:// paths.
         """
 
         scan_results: Dict[str, TarScanResult] = {}
+        members_by_tar: Dict[str, list] = {}  # tar_file -> pre-collected member data
 
         # Maps from sample key to list of tar files containing it
         duplicates: Dict[str, Set[str]] = {}
@@ -522,17 +531,19 @@ class TarPatcher:
             unit="shards",
             disable=not self._show_progress,
         ) as dataset_pbar:
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            with ProcessPoolExecutor(max_workers=max_workers,
+                                     mp_context=mp.get_context("spawn")) as executor:
                 jobs = [executor.submit(_scan_tar_worker, *task) for task in tasks]
                 for future in concurrent.futures.as_completed(jobs):
                     try:
-                        tar_file, result = future.result()
+                        tar_file, result, members_data = future.result()
                     except:
                         import traceback
-
                         traceback.print_exc()
                         raise
                     scan_results[tar_file] = result
+                    if members_data is not None:
+                        members_by_tar[tar_file] = members_data
                     if not result.compatible:
                         compatible = False
                     for sample_key in result.sample_keys:
@@ -555,6 +566,7 @@ class TarPatcher:
             compatible=compatible,
             duplicates=duplicate_map,
             scan_results=scan_results,
+            members_by_tar=members_by_tar,
         )
 
     def dataset_apply_prefix(
@@ -591,14 +603,57 @@ class TarPatcher:
                     future.result()
                     dataset_pbar.update()
 
-    def scan(self, tar_path: Path | str, prefix: str) -> TarScanResult:
-        """Scan *tar_path* and evaluate compatibility for prefixing entries."""
+    def scan(self, tar_path: Path | str, prefix: str) -> tuple[TarScanResult, list | None]:
+        """Scan *tar_path* and evaluate compatibility for prefixing entries.
+        Returns (TarScanResult, members_data) where members_data is a list of
+        {'offset_data', 'size', 'base_name', 'part_name'} dicts for msc:// paths
+        (collected in same download pass), or None for local paths.
+        """
+        import os as _os, time as _time
+        tar_path_str = str(tar_path)
+        members_data = None
+        if tar_path_str.startswith("msc://"):
+            from megatron.energon.epathlib import EPath
+            ep = EPath(tar_path_str)
+            os_fd, tmp_path = tempfile.mkstemp(suffix=".tar", dir="/dev/shm")
+            _os.close(os_fd)
+            t0 = _time.monotonic()
+            print(f"[energon] DOWNLOAD {tar_path_str} → {tmp_path}", flush=True)
+            try:
+                try:
+                    ep.copy(EPath(tmp_path))
+                except Exception as _dl_err:
+                    print(f"[energon] DOWNLOAD ERROR {tar_path_str}: {_dl_err}", flush=True)
+                    raise
+                size_mb = _os.path.getsize(tmp_path) / 1024**2
+                print(f"[energon] DOWNLOAD done {size_mb:.1f}MB ({_time.monotonic()-t0:.1f}s)  SCAN start", flush=True)
+                t1 = _time.monotonic()
+                prefix_bytes = np.frombuffer(prefix.encode("utf-8"), dtype=np.uint8)
+                raw_data = np.memmap(tmp_path, dtype=np.uint8, mode="r+")
+                compatible, sample_keys_list = _nb_scan_file(raw_data, prefix_bytes)
+                del raw_data
+                print(f"[energon] SCAN done  {len(sample_keys_list)} samples ({_time.monotonic()-t1:.1f}s)  COLLECT members", flush=True)
 
-        prefix_bytes = np.frombuffer(prefix.encode("utf-8"), dtype=np.uint8)
-
-        raw_data = np.memmap(tar_path, dtype=np.uint8, mode="r+")
-
-        compatible, sample_keys_list = _nb_scan_file(raw_data, prefix_bytes)
+                # Collect member data in the same pass — avoids re-downloading in aggregator
+                import tarfile as _tarfile
+                members_data = []
+                with open(tmp_path, "rb") as _f, _tarfile.open(fileobj=_f, mode="r:*") as _tar:
+                    from megatron.energon.flavors.webdataset.prepare import WebdatasetPreparator
+                    for _member, _base_name, _part_name in WebdatasetPreparator._iter_tar_sample_members(_tar):
+                        members_data.append({
+                            "offset": _member.offset,        # tar header offset
+                            "offset_data": _member.offset_data,  # data offset
+                            "size": _member.size,
+                            "base_name": _base_name,
+                            "part_name": _part_name,
+                        })
+                print(f"[energon] COLLECT done  {len(members_data)} members", flush=True)
+            finally:
+                _os.unlink(tmp_path)
+        else:
+            prefix_bytes = np.frombuffer(prefix.encode("utf-8"), dtype=np.uint8)
+            raw_data = np.memmap(tar_path, dtype=np.uint8, mode="r+")
+            compatible, sample_keys_list = _nb_scan_file(raw_data, prefix_bytes)
 
         # Convert numpy arrays to bytes for the set
         sample_keys_set = {sample_key.tobytes() for sample_key in sample_keys_list}
@@ -616,7 +671,7 @@ class TarPatcher:
         return TarScanResult(
             sample_keys=sample_keys_set,
             compatible=compatible,
-        )
+        ), members_data
 
     def apply_prefix(
         self,
@@ -668,10 +723,21 @@ class TarPatcher:
         )
 
 
-def _scan_tar_worker(tar_file: str, prefix: str) -> tuple[str, TarScanResult]:
-    patcher = TarPatcher(show_progress=False)
-    result = patcher.scan(tar_file, prefix)
-    return tar_file, result
+def _scan_tar_worker(tar_file: str, prefix: str, output_path: str | None = None) -> tuple[str, TarScanResult, list | None]:
+    import time
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            patcher = TarPatcher(show_progress=False)
+            result, members_data = patcher.scan(tar_file, prefix)
+            return tar_file, result, members_data
+        except Exception as e:
+            if attempt < max_retries - 1:
+                wait = min(5 * (2 ** attempt), 60)  # 5s, 10s, 20s, 40s, 60s
+                print(f"[energon] scan {tar_file} attempt {attempt+1}/{max_retries} failed ({e}), retrying in {wait}s...", flush=True)
+                time.sleep(wait)
+            else:
+                raise
 
 
 def _apply_prefix_worker(tar_file: str, prefix: str) -> str:

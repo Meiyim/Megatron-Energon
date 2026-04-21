@@ -4,6 +4,7 @@
 import dataclasses
 import inspect
 import json
+import logging
 import re
 import typing
 from types import FunctionType
@@ -11,6 +12,8 @@ from typing import Any, List, Optional, Tuple, Type
 
 import click
 import yaml
+
+log = logging.getLogger(__name__)
 
 from megatron.energon.epathlib import EPath
 from megatron.energon.flavors import (
@@ -184,6 +187,12 @@ def printify_json(data: Any) -> Any:
     help='Field mapping in JSON format (e.g., \'{"image": "jpg", "caption": "txt"}\'). If not set in non-interactive mode, a sample loader from template will be created. Use with --sample-type. Only applies if sample_type is not set to CrudeWebdataset.',
     default=None,
 )
+@click.option(
+    "--output",
+    help="Local directory to write .nv-meta/ into instead of alongside the tars (useful for remote/msc:// datasets).",
+    default=None,
+    type=click.Path(),
+)
 def command(
     path: EPath,
     progress: bool,
@@ -203,6 +212,7 @@ def command(
     field_map: Optional[str],
     skip_dataset_yaml: bool,
     dataset_yaml_name: str,
+    output: Optional[str],
 ):
     """Prepare WebDataset for use with energon.
 
@@ -210,6 +220,16 @@ def command(
     This tool will add the required metadata yaml files to the dataset. See README.md for more
     details.
     """
+    from pathlib import Path as _Path
+    from megatron.energon.global_handle_manager import _patch_s3_fork_safety
+    _patch_s3_fork_safety()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    # If --output is given, write .nv-meta/ to that local dir instead of alongside tars
+    meta_path: EPath = EPath(_Path(output)) if output else path
 
     do_media_metadata = bool(
         media_metadata_by_glob is not None
@@ -340,6 +360,7 @@ def command(
     found_types = BaseWebdatasetFactory.prepare_dataset(
         path,
         all_tars,
+        meta_path=meta_path,
         split_parts_ratio=split_parts_ratio,
         split_parts_patterns=split_parts_patterns,
         progress_fn=progress_fn,
@@ -542,7 +563,7 @@ def command(
                 else:
                     template_part_types = found_types
 
-                sample_loader_exists = (path / MAIN_FOLDER_NAME / "sample_loader.py").is_file()
+                sample_loader_exists = (meta_path / MAIN_FOLDER_NAME / "sample_loader.py").is_file()
 
                 if not sample_loader_exists:
                     # Always create if it doesn't exist
@@ -557,7 +578,7 @@ def command(
                     )
 
                 if should_create_sample_loader:
-                    with (path / MAIN_FOLDER_NAME / "sample_loader.py").open("w") as f:
+                    with (meta_path / MAIN_FOLDER_NAME / "sample_loader.py").open("w") as f:
                         f.write(
                             sample_loader_template(
                                 dataclasses.fields(cls),
@@ -565,14 +586,14 @@ def command(
                             )
                         )
                     click.echo(
-                        f"\nCreated {path / MAIN_FOLDER_NAME / 'sample_loader.py'}. Please edit it to "
+                        f"\nCreated {meta_path / MAIN_FOLDER_NAME / 'sample_loader.py'}. Please edit it to "
                         f"return the proper values."
                     )
                 dataset_definition["sample_loader"] = "sample_loader.py:sample_loader"
                 dataset_definition["part_filter"] = "sample_loader.py:part_filter"
 
         # Write the dataset.yaml file
-        with (path / MAIN_FOLDER_NAME / dataset_yaml_name).open("w") as f:
+        with (meta_path / MAIN_FOLDER_NAME / dataset_yaml_name).open("w") as f:
             yaml.dump(dataset_definition, f, sort_keys=False)
     else:
         click.echo("You will have to add a dataset.yaml manually.")
