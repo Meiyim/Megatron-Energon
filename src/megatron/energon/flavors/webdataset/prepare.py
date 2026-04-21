@@ -59,6 +59,9 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", covariant=True)
 
+# Module-level cache for pre-collected tar member data (set before AggregatorPool fork)
+_pre_collected_members_by_tar: dict = {}
+
 
 @edataclass
 class IndexAggregatable:
@@ -242,6 +245,7 @@ class WebdatasetPreparator:
         parent_path: EPath,
         max_parts: int,
         media_filter: Optional[MediaFilterConfig] = None,
+        output_path: Optional[EPath] = None,
     ) -> Generator[IndexAggregatable, None, None]:
         """Process a single tar file, i.e. read the tarinfos, generate the tar index and return
         stats.
@@ -252,6 +256,7 @@ class WebdatasetPreparator:
             shard_to_idx: Mapping from shard path to its index
             parent_path: Root path of the dataset.
             max_parts: Maximum number of different parts to return
+            output_path: If set, write .tar.idx files here instead of alongside the tars.
 
         Returns:
             A generator of items that will be processed by SqliteIndexWriterAggregator.
@@ -261,96 +266,153 @@ class WebdatasetPreparator:
             - Or a tuple of shard info and a set of found parts for statistics.
         """
         shard_info = ShardInfo(name=path, path=parent_path / path, count=0)
+        from pathlib import PurePosixPath as _PPP
+        # Use output_path for .tar.idx if specified (redirect away from remote paths)
+        index_base = output_path if output_path is not None else shard_info.path.parent
+        index_tar_path = index_base / _PPP(path).name
 
+        tar_path_str = str(shard_info.path)
+        # Look up pre-collected members from class attribute (set before fork, inherited by workers)
+        members_cache = _pre_collected_members_by_tar
+        pre_collected_members = members_cache.get(tar_path_str)
+        if pre_collected_members is None and tar_path_str.startswith("msc://"):
+            # Key mismatch — dump a sample of available keys for debugging
+            sample_keys = list(members_cache.keys())[:3]
+            print(f"[energon] WARN: no pre-collected members for {tar_path_str!r}  "
+                  f"cache has {len(members_cache)} entries, sample keys: {sample_keys}", flush=True)
+        _tmp_tar = None
         try:
-            # Note: Write to .tmp file first, then remove .tmp extension, to make sure only complete
-            # files are used.
-            tar: tarfile.TarFile
-            with shard_info.path.open("rb") as f:
-                with (
-                    tarfile.open(fileobj=f, mode="r:*") as tar,
-                    TarIndexWriter(shard_info.path) as iw,
-                ):
-                    count = 0
+            if pre_collected_members is not None:
+                # Members already collected during scan — no tar download needed
+                _open_path = None
+            elif tar_path_str.startswith("msc://"):
+                raise RuntimeError(f"No pre-collected members for remote tar {tar_path_str!r} — scan may have failed for this shard")
+            else:
+                _open_path = shard_info.path.local_path()
 
-                    # The parts set is used to collect various file endings that are
-                    # available in the dataset. This is used for the interactive prepare wizard.
-                    parts = set()
-
-                    last_base_name = None
-
-                    next_index_sample = None
-
-                    for (
-                        member,
-                        base_name,
-                        part_name,
-                    ) in WebdatasetPreparator._iter_tar_sample_members(tar):
+            if pre_collected_members is not None:
+                # Use pre-collected member data — no tar download needed
+                count = 0
+                parts = set()
+                last_base_name = None
+                next_index_sample = None
+                with TarIndexWriter(index_tar_path) as iw:
+                    for m in pre_collected_members:
+                        base_name = m["base_name"]
+                        part_name = m["part_name"]
                         if len(parts) < max_parts:
                             parts.add(part_name)
-
                         if last_base_name != base_name:
-                            iw.append(member.offset)
-
+                            iw.append(m["offset"])
                             if next_index_sample is not None:
                                 next_index_sample["byte_size"] = (
-                                    member.offset - next_index_sample["byte_offset"]
+                                    m["offset"] - next_index_sample["byte_offset"]
                                 )
                                 yield IndexSample(**next_index_sample)
-
                             next_index_sample = dict(
                                 tar_file_id=shard_to_idx[path],
                                 sample_key=base_name,
                                 sample_index=count,
-                                byte_offset=member.offset,
+                                byte_offset=m["offset"],
                             )
                             last_base_name = base_name
                             count += 1
-
-                        entry_key = f"{base_name}.{part_name}"
-
-                        # Yield this part of the sample to the aggregator
                         yield IndexSamplePart(
                             tar_file_id=shard_to_idx[path],
                             sample_index=count - 1,
                             part_name=part_name,
-                            content_byte_offset=member.offset_data,
-                            content_byte_size=member.size,
+                            content_byte_offset=m["offset_data"],
+                            content_byte_size=m["size"],
                         )
-
-                        if media_filter is not None:
-                            if not media_filter.should_consider_media(entry_key):
-                                continue
-                            file_member = tar.extractfile(member)
-                            if file_member is not None:
-                                data = file_member.read()
-                                extracted_metadata = media_filter.extract_metadata(
-                                    data,
-                                    filename=entry_key,
-                                )
-                                if extracted_metadata is not None:
-                                    stored_type, metadata_json = serialize_media_metadata(
-                                        extracted_metadata
-                                    )
-                                    yield IndexMediaMetadata(
-                                        entry_key=entry_key,
-                                        metadata_type=stored_type.value,
-                                        metadata_json=metadata_json,
-                                    )
-
                     shard_info.count = count
-                    iw.append(tar.offset)
+                    if count == 0:
+                        print(f"[energon] WARN: shard {path} has 0 samples from pre-collected members", flush=True)
+                    # Final entry sentinel: use last header offset + aligned size as end marker
+                    last_end = (pre_collected_members[-1]["offset"] +
+                                512 * ((pre_collected_members[-1]["size"] + 511) // 512)
+                                ) if pre_collected_members else 0
+                    iw.append(last_end)
                     if next_index_sample is not None:
-                        next_index_sample["byte_size"] = (
-                            tar.offset - next_index_sample["byte_offset"]
-                        )
+                        next_index_sample["byte_size"] = last_end - next_index_sample["byte_offset"]
                         yield IndexSample(**next_index_sample)
+            else:
+                # Note: Write to .tmp file first, then remove .tmp extension, to make sure only complete
+                # files are used.
+                tar: tarfile.TarFile
+                with open(_open_path, "rb") as f:
+                    with (
+                        tarfile.open(fileobj=f, mode="r:*") as tar,
+                        TarIndexWriter(index_tar_path) as iw,
+                    ):
+                        count = 0
+                        parts = set()
+                        last_base_name = None
+                        next_index_sample = None
+
+                        for (
+                            member,
+                            base_name,
+                            part_name,
+                        ) in WebdatasetPreparator._iter_tar_sample_members(tar):
+                            if len(parts) < max_parts:
+                                parts.add(part_name)
+                            if last_base_name != base_name:
+                                iw.append(member.offset)
+                                if next_index_sample is not None:
+                                    next_index_sample["byte_size"] = (
+                                        member.offset - next_index_sample["byte_offset"]
+                                    )
+                                    yield IndexSample(**next_index_sample)
+                                next_index_sample = dict(
+                                    tar_file_id=shard_to_idx[path],
+                                    sample_key=base_name,
+                                    sample_index=count,
+                                    byte_offset=member.offset,
+                                )
+                                last_base_name = base_name
+                                count += 1
+                            entry_key = f"{base_name}.{part_name}"
+                            yield IndexSamplePart(
+                                tar_file_id=shard_to_idx[path],
+                                sample_index=count - 1,
+                                part_name=part_name,
+                                content_byte_offset=member.offset_data,
+                                content_byte_size=member.size,
+                            )
+                            if media_filter is not None:
+                                if not media_filter.should_consider_media(entry_key):
+                                    continue
+                                file_member = tar.extractfile(member)
+                                if file_member is not None:
+                                    data = file_member.read()
+                                    extracted_metadata = media_filter.extract_metadata(
+                                        data, filename=entry_key,
+                                    )
+                                    if extracted_metadata is not None:
+                                        stored_type, metadata_json = serialize_media_metadata(
+                                            extracted_metadata
+                                        )
+                                        yield IndexMediaMetadata(
+                                            entry_key=entry_key,
+                                            metadata_type=stored_type.value,
+                                            metadata_json=metadata_json,
+                                        )
+                        shard_info.count = count
+                        iw.append(tar.offset)
+                        if next_index_sample is not None:
+                            next_index_sample["byte_size"] = (
+                                tar.offset - next_index_sample["byte_offset"]
+                            )
+                            yield IndexSample(**next_index_sample)
             yield IndexShardInfo(shard_info=shard_info, parts=parts)
-            return
+            print(f"[energon] INDEX done {path}  count={shard_info.count}", flush=True)
         except BaseException:
             logger.exception(f"Shard failed to load: {path!r}. Skipping it.")
             yield IndexShardInfo(shard_info=shard_info, parts=set())
-            return
+        finally:
+            if _tmp_tar is not None:
+                import os as _os
+                _os.unlink(_tmp_tar)
 
     @staticmethod
     def _extract_media_from_tar(
@@ -464,6 +526,7 @@ class WebdatasetPreparator:
         parent_path: Union[Path, EPath],
         paths: List[str],
         *,
+        meta_path: Union[Path, EPath, None] = None,
         split_parts_ratio: Optional[List[Tuple[str, float]]] = None,
         split_parts_patterns: Optional[List[Tuple[str, str]]] = None,
         split_config: str = "split.yaml",
@@ -496,13 +559,14 @@ class WebdatasetPreparator:
             The set of all parts found in the shards. But at most 50.
         """
         parent_path = EPath(parent_path)
+        meta_path = EPath(meta_path) if meta_path is not None else parent_path
 
         paths = [path for path in paths for path in braceexpand.braceexpand(path)]
 
         # Construct a mapping from relative shard path to its index
         shard_to_idx = {path: idx for idx, path in enumerate(paths)}
 
-        (parent_path / MAIN_FOLDER_NAME).mkdir(exist_ok=True)
+        (meta_path / MAIN_FOLDER_NAME).mkdir(exist_ok=True)
 
         if parent_path.is_local():
             # Copy permissions from parent_path to json_info_config and yaml_info_config, making sure the owner can read and write.
@@ -510,7 +574,7 @@ class WebdatasetPreparator:
             try:
                 dir_perms = parent_path.local_path().stat().st_mode | 0o700
                 file_perms = (parent_path / paths[0]).local_path().stat().st_mode | 0o600
-                (parent_path / MAIN_FOLDER_NAME).local_path().chmod(dir_perms)
+                (meta_path / MAIN_FOLDER_NAME).local_path().chmod(dir_perms)
                 fix_local_permissions = True
             except OSError:
                 # Just ignore the error, it's not a big deal.
@@ -527,7 +591,7 @@ class WebdatasetPreparator:
                 raise
             tar_patcher = TarPatcher(show_progress=True)
             scan_result = tar_patcher.dataset_scan(
-                paths, parent_path=parent_path, num_workers=workers
+                paths, parent_path=parent_path, num_workers=workers,
             )
 
             if scan_result.has_duplicates:
@@ -547,19 +611,25 @@ class WebdatasetPreparator:
                 print("No duplicate keys found, continuing.")
 
         aggregator = SqliteIndexWriterAggregator(
-            parent_path / MAIN_FOLDER_NAME / INDEX_SQLITE_FILENAME,
+            meta_path / MAIN_FOLDER_NAME / INDEX_SQLITE_FILENAME,
             total_tasks=len(paths),
             progress_fn=progress_fn,
             enable_media_metadata=media_filter is not None,
             media_filter=media_filter,
         )
 
+        # Store members dict as class attribute so forked AggregatorPool workers
+        # inherit it via copy-on-write (no serialization overhead per task)
+        # Populate module-level cache before AggregatorPool forks workers (copy-on-write)
+        global _pre_collected_members_by_tar
+        _pre_collected_members_by_tar = scan_result.members_by_tar if hasattr(scan_result, 'members_by_tar') else {}
         process_tar = functools.partial(
             cls._preprocess_tar,
             shard_to_idx=shard_to_idx,
             parent_path=parent_path,
             max_parts=50,
             media_filter=media_filter,
+            output_path=meta_path if meta_path is not parent_path else None,
         )
 
         pool = AggregatorPool(
@@ -583,34 +653,34 @@ class WebdatasetPreparator:
                 "put each file in a subfolder with the shard name like `shard_0/filename.ext`."
             )
 
-            if (parent_path / MAIN_FOLDER_NAME / INDEX_SQLITE_FILENAME).is_file():
-                (parent_path / MAIN_FOLDER_NAME / INDEX_SQLITE_FILENAME).unlink()
+            if (meta_path / MAIN_FOLDER_NAME / INDEX_SQLITE_FILENAME).is_file():
+                (meta_path / MAIN_FOLDER_NAME / INDEX_SQLITE_FILENAME).unlink()
 
             sys.exit(1)
 
         # Fix permissions if needed
         if fix_local_permissions:
             try:
-                Path(str(parent_path / MAIN_FOLDER_NAME / INDEX_SQLITE_FILENAME)).chmod(file_perms)
+                Path(str(meta_path / MAIN_FOLDER_NAME / INDEX_SQLITE_FILENAME)).chmod(file_perms)
             except OSError:
                 pass
 
         if had_update:
             logger.info("Regenerating dataset UUID...")
-            with (parent_path / MAIN_FOLDER_NAME / INDEX_UUID_FILENAME).open("w") as f:
+            with (meta_path / MAIN_FOLDER_NAME / INDEX_UUID_FILENAME).open("w") as f:
                 f.write(str(uuid.uuid4()))
 
             # Fix permissions if needed
             if fix_local_permissions:
                 try:
-                    (parent_path / MAIN_FOLDER_NAME / INDEX_UUID_FILENAME).local_path().chmod(
+                    (meta_path / MAIN_FOLDER_NAME / INDEX_UUID_FILENAME).local_path().chmod(
                         file_perms
                     )
                 except OSError:
                     pass
 
-        json_info_config = parent_path / MAIN_FOLDER_NAME / INFO_JSON_FILENAME
-        yaml_info_config = parent_path / MAIN_FOLDER_NAME / INFO_YAML_FILENAME
+        json_info_config = meta_path / MAIN_FOLDER_NAME / INFO_JSON_FILENAME
+        yaml_info_config = meta_path / MAIN_FOLDER_NAME / INFO_YAML_FILENAME
 
         if tar_index_only:
             if yaml_info_config.is_file() and not json_info_config.is_file():
@@ -702,7 +772,7 @@ class WebdatasetPreparator:
 
         # Save split config
         splits_config = WebdatasetSplits(split_parts=split_shards)
-        with (parent_path / MAIN_FOLDER_NAME / split_config).open("w") as wf:
+        with (meta_path / MAIN_FOLDER_NAME / split_config).open("w") as wf:
             if split_config.endswith(".yaml"):
                 yaml.dump(to_json_object(splits_config), wf, sort_keys=False)
             elif split_config.endswith(".json"):
@@ -713,7 +783,7 @@ class WebdatasetPreparator:
         # Fix permissions if needed
         if fix_local_permissions:
             try:
-                (parent_path / MAIN_FOLDER_NAME / split_config).local_path().chmod(file_perms)
+                (meta_path / MAIN_FOLDER_NAME / split_config).local_path().chmod(file_perms)
             except OSError:
                 pass
 
@@ -746,7 +816,7 @@ class WebdatasetPreparator:
                 raise ValueError(f"Shard '{path}' not present in dataset metadata")
 
         aggregator = SqliteIndexWriterAggregator(
-            parent_path / MAIN_FOLDER_NAME / INDEX_SQLITE_FILENAME,
+            meta_path / MAIN_FOLDER_NAME / INDEX_SQLITE_FILENAME,
             total_tasks=len(expanded_paths),
             progress_fn=progress_fn,
             enable_sample_tables=False,
