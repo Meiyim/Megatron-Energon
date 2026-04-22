@@ -59,9 +59,6 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", covariant=True)
 
-# Module-level cache for pre-collected tar member data (set before AggregatorPool fork)
-_pre_collected_members_by_tar: dict = {}
-
 
 @edataclass
 class IndexAggregatable:
@@ -272,74 +269,26 @@ class WebdatasetPreparator:
         index_tar_path = index_base / _PPP(path).name
 
         tar_path_str = str(shard_info.path)
-        # Look up pre-collected members from class attribute (set before fork, inherited by workers)
-        members_cache = _pre_collected_members_by_tar
-        pre_collected_members = members_cache.get(tar_path_str)
-        if pre_collected_members is None and tar_path_str.startswith("msc://"):
-            # Key mismatch — dump a sample of available keys for debugging
-            sample_keys = list(members_cache.keys())[:3]
-            print(f"[energon] WARN: no pre-collected members for {tar_path_str!r}  "
-                  f"cache has {len(members_cache)} entries, sample keys: {sample_keys}", flush=True)
+        import os as _os, tempfile as _tmpfile
         _tmp_tar = None
         try:
-            if pre_collected_members is not None:
-                # Members already collected during scan — no tar download needed
-                _open_path = None
-            elif tar_path_str.startswith("msc://"):
-                raise RuntimeError(f"No pre-collected members for remote tar {tar_path_str!r} — scan may have failed for this shard")
+            # Download remote tar to /dev/shm, or use local path directly
+            if tar_path_str.startswith("msc://"):
+                from megatron.energon.epathlib import EPath as _EPath
+                _fd, _tmp_tar = _tmpfile.mkstemp(suffix=".tar", dir="/dev/shm")
+                _os.close(_fd)
+                print(f"[energon] DOWNLOAD {path} → {_tmp_tar}", flush=True)
+                _EPath(tar_path_str).copy(_EPath(_tmp_tar))
+                _sz = _os.path.getsize(_tmp_tar)
+                if _sz == 0:
+                    raise RuntimeError(f"Downloaded 0 bytes for {tar_path_str}")
+                print(f"[energon] DOWNLOAD done {_sz / 1024**2:.1f}MB", flush=True)
+                _open_path = _tmp_tar
             else:
                 _open_path = shard_info.path.local_path()
 
-            if pre_collected_members is not None:
-                # Use pre-collected member data — no tar download needed
-                count = 0
-                parts = set()
-                last_base_name = None
-                next_index_sample = None
-                with TarIndexWriter(index_tar_path) as iw:
-                    for m in pre_collected_members:
-                        base_name = m["base_name"]
-                        part_name = m["part_name"]
-                        if len(parts) < max_parts:
-                            parts.add(part_name)
-                        if last_base_name != base_name:
-                            iw.append(m["offset"])
-                            if next_index_sample is not None:
-                                next_index_sample["byte_size"] = (
-                                    m["offset"] - next_index_sample["byte_offset"]
-                                )
-                                yield IndexSample(**next_index_sample)
-                            next_index_sample = dict(
-                                tar_file_id=shard_to_idx[path],
-                                sample_key=base_name,
-                                sample_index=count,
-                                byte_offset=m["offset"],
-                            )
-                            last_base_name = base_name
-                            count += 1
-                        yield IndexSamplePart(
-                            tar_file_id=shard_to_idx[path],
-                            sample_index=count - 1,
-                            part_name=part_name,
-                            content_byte_offset=m["offset_data"],
-                            content_byte_size=m["size"],
-                        )
-                    shard_info.count = count
-                    if count == 0:
-                        print(f"[energon] WARN: shard {path} has 0 samples from pre-collected members", flush=True)
-                    # Final entry sentinel: use last header offset + aligned size as end marker
-                    last_end = (pre_collected_members[-1]["offset"] +
-                                512 * ((pre_collected_members[-1]["size"] + 511) // 512)
-                                ) if pre_collected_members else 0
-                    iw.append(last_end)
-                    if next_index_sample is not None:
-                        next_index_sample["byte_size"] = last_end - next_index_sample["byte_offset"]
-                        yield IndexSample(**next_index_sample)
-            else:
-                # Note: Write to .tmp file first, then remove .tmp extension, to make sure only complete
-                # files are used.
-                tar: tarfile.TarFile
-                with open(_open_path, "rb") as f:
+            tar: tarfile.TarFile
+            with open(_open_path, "rb") as f:
                     with (
                         tarfile.open(fileobj=f, mode="r:*") as tar,
                         TarIndexWriter(index_tar_path) as iw,
@@ -618,11 +567,6 @@ class WebdatasetPreparator:
             media_filter=media_filter,
         )
 
-        # Store members dict as class attribute so forked AggregatorPool workers
-        # inherit it via copy-on-write (no serialization overhead per task)
-        # Populate module-level cache before AggregatorPool forks workers (copy-on-write)
-        global _pre_collected_members_by_tar
-        _pre_collected_members_by_tar = scan_result.members_by_tar if hasattr(scan_result, 'members_by_tar') else {}
         process_tar = functools.partial(
             cls._preprocess_tar,
             shard_to_idx=shard_to_idx,

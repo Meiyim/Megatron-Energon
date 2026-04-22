@@ -56,13 +56,6 @@ class DatasetScanResult:
     compatible: bool
     duplicates: Dict[str, List[str]]
     scan_results: Dict[str, TarScanResult]
-    members_by_tar: Dict[str, list]  # tar_file -> pre-collected member dicts (msc:// only)
-
-    def __init__(self, compatible, duplicates, scan_results, members_by_tar=None):
-        self.compatible = compatible
-        self.duplicates = duplicates
-        self.scan_results = scan_results
-        self.members_by_tar = members_by_tar or {}
 
     @property
     def has_duplicates(self) -> bool:
@@ -500,7 +493,6 @@ class TarPatcher:
         """
 
         scan_results: Dict[str, TarScanResult] = {}
-        members_by_tar: Dict[str, list] = {}  # tar_file -> pre-collected member data
 
         # Maps from sample key to list of tar files containing it
         duplicates: Dict[str, Set[str]] = {}
@@ -536,14 +528,12 @@ class TarPatcher:
                 jobs = [executor.submit(_scan_tar_worker, *task) for task in tasks]
                 for future in concurrent.futures.as_completed(jobs):
                     try:
-                        tar_file, result, members_data = future.result()
+                        tar_file, result = future.result()
                     except:
                         import traceback
                         traceback.print_exc()
                         raise
                     scan_results[tar_file] = result
-                    if members_data is not None:
-                        members_by_tar[tar_file] = members_data
                     if not result.compatible:
                         compatible = False
                     for sample_key in result.sample_keys:
@@ -552,7 +542,6 @@ class TarPatcher:
                             have_duplicates = True
 
                     if have_duplicates and not compatible:
-                        # Let's stop early if we have duplicates and the dataset is not compatible for fixing
                         break
 
                     dataset_pbar.update()
@@ -566,7 +555,6 @@ class TarPatcher:
             compatible=compatible,
             duplicates=duplicate_map,
             scan_results=scan_results,
-            members_by_tar=members_by_tar,
         )
 
     def dataset_apply_prefix(
@@ -605,13 +593,10 @@ class TarPatcher:
 
     def scan(self, tar_path: Path | str, prefix: str) -> tuple[TarScanResult, list | None]:
         """Scan *tar_path* and evaluate compatibility for prefixing entries.
-        Returns (TarScanResult, members_data) where members_data is a list of
-        {'offset_data', 'size', 'base_name', 'part_name'} dicts for msc:// paths
-        (collected in same download pass), or None for local paths.
+        Returns TarScanResult.
         """
         import os as _os, time as _time
         tar_path_str = str(tar_path)
-        members_data = None
         if tar_path_str.startswith("msc://"):
             from megatron.energon.epathlib import EPath
             ep = EPath(tar_path_str)
@@ -632,22 +617,7 @@ class TarPatcher:
                 raw_data = np.memmap(tmp_path, dtype=np.uint8, mode="r+")
                 compatible, sample_keys_list = _nb_scan_file(raw_data, prefix_bytes)
                 del raw_data
-                print(f"[energon] SCAN done  {len(sample_keys_list)} samples ({_time.monotonic()-t1:.1f}s)  COLLECT members", flush=True)
-
-                # Collect member data in the same pass — avoids re-downloading in aggregator
-                import tarfile as _tarfile
-                members_data = []
-                with open(tmp_path, "rb") as _f, _tarfile.open(fileobj=_f, mode="r:*") as _tar:
-                    from megatron.energon.flavors.webdataset.prepare import WebdatasetPreparator
-                    for _member, _base_name, _part_name in WebdatasetPreparator._iter_tar_sample_members(_tar):
-                        members_data.append({
-                            "offset": _member.offset,        # tar header offset
-                            "offset_data": _member.offset_data,  # data offset
-                            "size": _member.size,
-                            "base_name": _base_name,
-                            "part_name": _part_name,
-                        })
-                print(f"[energon] COLLECT done  {len(members_data)} members", flush=True)
+                print(f"[energon] SCAN done  {len(sample_keys_list)} samples ({_time.monotonic()-t1:.1f}s)", flush=True)
             finally:
                 _os.unlink(tmp_path)
         else:
@@ -671,7 +641,7 @@ class TarPatcher:
         return TarScanResult(
             sample_keys=sample_keys_set,
             compatible=compatible,
-        ), members_data
+        )
 
     def apply_prefix(
         self,
@@ -723,17 +693,17 @@ class TarPatcher:
         )
 
 
-def _scan_tar_worker(tar_file: str, prefix: str, output_path: str | None = None) -> tuple[str, TarScanResult, list | None]:
+def _scan_tar_worker(tar_file: str, prefix: str) -> tuple[str, TarScanResult]:
     import time
     max_retries = 5
     for attempt in range(max_retries):
         try:
             patcher = TarPatcher(show_progress=False)
-            result, members_data = patcher.scan(tar_file, prefix)
-            return tar_file, result, members_data
+            result = patcher.scan(tar_file, prefix)
+            return tar_file, result
         except Exception as e:
             if attempt < max_retries - 1:
-                wait = min(5 * (2 ** attempt), 60)  # 5s, 10s, 20s, 40s, 60s
+                wait = min(5 * (2 ** attempt), 60)
                 print(f"[energon] scan {tar_file} attempt {attempt+1}/{max_retries} failed ({e}), retrying in {wait}s...", flush=True)
                 time.sleep(wait)
             else:

@@ -31,6 +31,8 @@ from megatron.energon.flavors.webdataset.metadata import (
 )
 from megatron.energon.media.extractor import MediaFilterConfig
 from megatron.energon.metadataset.loader import prepare_metadataset
+from megatron.energon.global_handle_manager import _patch_s3_fork_safety
+_patch_s3_fork_safety()
 
 
 def type_str(tp: Type) -> str:
@@ -221,8 +223,6 @@ def command(
     details.
     """
     from pathlib import Path as _Path
-    from megatron.energon.global_handle_manager import _patch_s3_fork_safety
-    _patch_s3_fork_safety()
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
