@@ -248,6 +248,9 @@ class WebdatasetPreparator:
         stats.
         This method is passed to the `user_produce_data` argument of AggregatorPool.
 
+        If a pre-computed .meta.jsonl sidecar exists alongside the tar, loads index data
+        from it instead of downloading and scanning the tar.
+
         Args:
             path: Path to the tar file.
             shard_to_idx: Mapping from shard path to its index
@@ -270,9 +273,46 @@ class WebdatasetPreparator:
 
         tar_path_str = str(shard_info.path)
         import os as _os, tempfile as _tmpfile
+
+        # Try loading pre-computed .meta.jsonl sidecar (avoids downloading the full tar)
+        meta_remote = EPath(tar_path_str.replace(".tar", ".meta.jsonl"))
+        try:
+            if meta_remote.is_file():
+                _fd, _tmp_meta = _tmpfile.mkstemp(suffix=".meta.jsonl", dir="/dev/shm")
+                _os.close(_fd)
+                try:
+                    print(f"[energon] META download {path}", flush=True)
+                    meta_remote.copy(EPath(_tmp_meta))
+                    tar_file_id = shard_to_idx[path]
+                    found_parts: Set[str] = set()
+
+                    with open(_tmp_meta, "r") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            entry = json.loads(line)
+                            entry_type = entry.pop("type")
+
+                            if entry_type == "shard_info":
+                                shard_info.count = entry["count"]
+                                found_parts.update(entry.get("parts", []))
+                            elif entry_type == "sample":
+                                yield IndexSample(tar_file_id=tar_file_id, **entry)
+                            elif entry_type == "part":
+                                yield IndexSamplePart(tar_file_id=tar_file_id, **entry)
+
+                    yield IndexShardInfo(shard_info=shard_info, parts=found_parts)
+                    print(f"[energon] META done {path}  count={shard_info.count}", flush=True)
+                    return
+                finally:
+                    _os.unlink(_tmp_meta)
+        except Exception:
+            print(f"[energon] META failed for {path}, falling back to tar scan", flush=True)
+
+        # Fallback: download and scan the tar
         _tmp_tar = None
         try:
-            # Download remote tar to /dev/shm, or use local path directly
             if tar_path_str.startswith("msc://"):
                 from megatron.energon.epathlib import EPath as _EPath
                 _fd, _tmp_tar = _tmpfile.mkstemp(suffix=".tar", dir="/dev/shm")
