@@ -68,18 +68,29 @@ class SqliteIndexWriter:
         path = self.sqlite_path.local_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path)
-        self.db.execute("PRAGMA busy_timeout = 5000;")  # wait up to 5000ms when locked
+        self.db.execute("PRAGMA busy_timeout = 5000;")
+        self.db.execute("PRAGMA journal_mode = WAL")
+        self.db.execute("PRAGMA synchronous = OFF")
+        self.db.execute("PRAGMA cache_size = -512000")
+        self.db.execute("PRAGMA mmap_size = 1073741824")
+        self.db.execute("PRAGMA temp_store = MEMORY")
 
-        if self.enable_sample_tables:
-            assert self.reset_tables, "Reset tables is required when enabling sample tables"
+        self._sample_buf = []
+        self._part_buf = []
+        self._media_buf = []
+        self._BATCH = 50_000
 
+        if self.reset_tables:
+            # Always drop stale tables from previous runs, regardless of enable_sample_tables
             self.db.execute("DROP INDEX IF EXISTS idx_samples_sample_key")
             self.db.execute("DROP INDEX IF EXISTS idx_samples_by_tar_and_idx")
             self.db.execute("DROP TABLE IF EXISTS samples")
-
             self.db.execute("DROP INDEX IF EXISTS idx_sample_parts_seq")
             self.db.execute("DROP INDEX IF EXISTS idx_sample_parts_full")
             self.db.execute("DROP TABLE IF EXISTS sample_parts")
+
+        if self.enable_sample_tables:
+            assert self.reset_tables, "Reset tables is required when enabling sample tables"
 
             self.db.execute(
                 """
@@ -149,18 +160,9 @@ class SqliteIndexWriter:
         """
 
         assert self.db is not None, "Database is closed"
-
-        # Insert a row in the samples table
-        try:
-            self.db.execute(
-                """
-                INSERT INTO samples (tar_file_id, sample_key, sample_index, byte_offset, byte_size)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (tar_file_id, sample_key, sample_index, byte_offset, byte_size),
-            )
-        except sqlite3.IntegrityError as exc:  # pragma: no cover - defensive programming
-            raise DuplicateSampleKeyError(sample_key) from exc
+        self._sample_buf.append((tar_file_id, sample_key, sample_index, byte_offset, byte_size))
+        if len(self._sample_buf) >= self._BATCH:
+            self._flush_samples()
 
     def append_part(
         self,
@@ -173,15 +175,9 @@ class SqliteIndexWriter:
         """Adds a new part row to the samples table."""
 
         assert self.db is not None, "Database is closed"
-
-        # Insert a row in the sample parts table
-        self.db.execute(
-            """
-            INSERT INTO sample_parts (tar_file_id, sample_index, part_name, content_byte_offset, content_byte_size)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (tar_file_id, sample_index, part_name, content_byte_offset, content_byte_size),
-        )
+        self._part_buf.append((tar_file_id, sample_index, part_name, content_byte_offset, content_byte_size))
+        if len(self._part_buf) >= self._BATCH:
+            self._flush_parts()
 
     def append_media_metadata(
         self,
@@ -192,16 +188,10 @@ class SqliteIndexWriter:
         """Insert or update a media metadata record."""
 
         assert self.enable_media_metadata, "Adding media metadata, although not enabled"
-
         assert self.db is not None, "Database is closed"
-
-        self.db.execute(
-            """
-            INSERT OR REPLACE INTO media_metadata (entry_key, metadata_type, metadata_json)
-            VALUES (?, ?, ?)
-            """,
-            (entry_key, metadata_type, metadata_json),
-        )
+        self._media_buf.append((entry_key, metadata_type, metadata_json))
+        if len(self._media_buf) >= self._BATCH:
+            self._flush_media()
 
     def append_media_filter(self, *, strategy: str, patterns: str | None) -> None:
         assert self.db is not None, "Database is closed"
@@ -210,37 +200,76 @@ class SqliteIndexWriter:
             (strategy, patterns),
         )
 
+    def _flush_samples(self):
+        if self._sample_buf:
+            try:
+                self.db.executemany(
+                    "INSERT INTO samples (tar_file_id, sample_key, sample_index, byte_offset, byte_size) VALUES (?, ?, ?, ?, ?)",
+                    self._sample_buf,
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DuplicateSampleKeyError(str(exc)) from exc
+            self._sample_buf.clear()
+
+    def _flush_parts(self):
+        if self._part_buf:
+            self.db.executemany(
+                "INSERT INTO sample_parts (tar_file_id, sample_index, part_name, content_byte_offset, content_byte_size) VALUES (?, ?, ?, ?, ?)",
+                self._part_buf,
+            )
+            self._part_buf.clear()
+
+    def _flush_media(self):
+        if self._media_buf:
+            self.db.executemany(
+                "INSERT OR REPLACE INTO media_metadata (entry_key, metadata_type, metadata_json) VALUES (?, ?, ?)",
+                self._media_buf,
+            )
+            self._media_buf.clear()
+
     def close(self):
         """
         Closes the DB connection. If finalize=True, the temporary database is
         renamed to the final name, overwriting if necessary.
         """
+        import time as _time
         assert self.db is not None, "Database is closed"
 
+        t0 = _time.monotonic()
+        self._flush_samples()
+        self._flush_parts()
+        self._flush_media()
+        print(f"[energon] INDEX flush done ({_time.monotonic()-t0:.1f}s)", flush=True)
+
         if self.enable_sample_tables:
-            # Create the index after adding all the samples for better speed
-            # Index on sample_key for fast lookups
+            t1 = _time.monotonic()
             self.db.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_samples_sample_key ON samples(sample_key)"
             )
+            print(f"[energon] INDEX idx_samples_sample_key ({_time.monotonic()-t1:.1f}s)", flush=True)
 
-            # Create index on the samples table.  Help the planner if it chooses `samples` as the probe side of the join
+            t1 = _time.monotonic()
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_samples_by_tar_and_idx ON samples(tar_file_id, sample_index)"
             )
+            print(f"[energon] INDEX idx_samples_by_tar_and_idx ({_time.monotonic()-t1:.1f}s)", flush=True)
 
-            # Create index on the sample_parts table for fast sequential access
+            t1 = _time.monotonic()
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sample_parts_seq ON sample_parts(tar_file_id, sample_index, content_byte_offset)"
             )
+            print(f"[energon] INDEX idx_sample_parts_seq ({_time.monotonic()-t1:.1f}s)", flush=True)
 
-            # Create a full index on the sample_parts table for equality lookups and getting offsets directly from key
+            t1 = _time.monotonic()
             self.db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_sample_parts_full ON sample_parts(tar_file_id, sample_index, part_name, content_byte_offset, content_byte_size)"
             )
+            print(f"[energon] INDEX idx_sample_parts_full ({_time.monotonic()-t1:.1f}s)", flush=True)
 
         if self.db is not None:
+            t1 = _time.monotonic()
             self.db.commit()
+            print(f"[energon] INDEX commit ({_time.monotonic()-t1:.1f}s)  total close={_time.monotonic()-t0:.1f}s", flush=True)
             self.db.close()
             self.db = None
 

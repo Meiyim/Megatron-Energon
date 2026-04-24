@@ -143,6 +143,9 @@ class SqliteIndexWriterAggregator(
         self.reset_tables = reset_tables
         self.media_metadata_written = 0
         self.progress_on_media = progress_on_media
+        self._sample_count = 0
+        self._part_count = 0
+        self._LOG_INTERVAL = 500_000
 
         if progress_fn is not None:
             self.prog_iter = progress_fn(iter(range(self.total_tasks)), self.total_tasks)
@@ -150,6 +153,9 @@ class SqliteIndexWriterAggregator(
             self.prog_iter = iter(range(self.total_tasks))
 
     def on_start(self, aggregator_pool: AggregatorPool) -> None:
+        import time as _time
+        self._t0 = _time.monotonic()
+        self._last_log_t = self._t0
         self.writer = SqliteIndexWriter(
             self.sqlite_path,
             enable_sample_tables=self.enable_sample_tables,
@@ -164,10 +170,24 @@ class SqliteIndexWriterAggregator(
     ) -> None:
         assert self.writer is not None, "Writer is not initialized."
         if isinstance(item, IndexSample):
-            self.writer.append_sample(**asdict(item))
-            self.had_update = True
+            if self.enable_sample_tables:
+                self.writer.append_sample(**asdict(item))
+                self.had_update = True
+            self._sample_count += 1
+            if self._sample_count % self._LOG_INTERVAL == 0:
+                import time as _time
+                now = _time.monotonic()
+                elapsed = now - self._t0
+                rate = self._sample_count / elapsed
+                since_last = now - self._last_log_t
+                self._last_log_t = now
+                print(f"[energon] INDEX {self._sample_count:,} samples  {self._part_count:,} parts"
+                      f"  {elapsed:.1f}s elapsed  {rate/1000:.0f}k samples/s"
+                      f"  (+{since_last:.1f}s for last {self._LOG_INTERVAL//1000}k)", flush=True)
         elif isinstance(item, IndexSamplePart):
-            self.writer.append_part(**asdict(item))
+            if self.enable_sample_tables:
+                self.writer.append_part(**asdict(item))
+            self._part_count += 1
         elif isinstance(item, IndexMediaMetadata):
             self.writer.append_media_metadata(
                 entry_key=item.entry_key,
@@ -196,7 +216,9 @@ class SqliteIndexWriterAggregator(
                 strategy=self.media_filter.strategy.value,
                 patterns=",".join(self.media_filter.patterns),
             )
+        print(f"[energon] INDEX flush+commit {self._sample_count:,} samples  {self._part_count:,} parts ...", flush=True)
         self.writer.close()
+        print(f"[energon] INDEX done", flush=True)
 
     def get_final_result_data(
         self,
@@ -243,6 +265,7 @@ class WebdatasetPreparator:
         max_parts: int,
         media_filter: Optional[MediaFilterConfig] = None,
         output_path: Optional[EPath] = None,
+        enable_sample_tables: bool = True,
     ) -> Generator[IndexAggregatable, None, None]:
         """Process a single tar file, i.e. read the tarinfos, generate the tar index and return
         stats.
@@ -297,6 +320,9 @@ class WebdatasetPreparator:
                             if entry_type == "shard_info":
                                 shard_info.count = entry["count"]
                                 found_parts.update(entry.get("parts", []))
+                                if not enable_sample_tables:
+                                    # shard_info is always line 1 — no need to read further
+                                    break
                             elif entry_type == "sample":
                                 yield IndexSample(tar_file_id=tar_file_id, **entry)
                             elif entry_type == "part":
@@ -525,6 +551,7 @@ class WebdatasetPreparator:
         tar_index_only: bool = False,
         media_filter: Optional[MediaFilterConfig] = None,
         fix_duplicates: bool = False,
+        enable_sample_tables: bool = True,
     ) -> Tuple[Set[str], List[Tuple[str, int]]]:
         """
         Preprocess the shards and write the split config. Preprocessing is done in parallel.
@@ -603,6 +630,7 @@ class WebdatasetPreparator:
             meta_path / MAIN_FOLDER_NAME / INDEX_SQLITE_FILENAME,
             total_tasks=len(paths),
             progress_fn=progress_fn,
+            enable_sample_tables=enable_sample_tables,
             enable_media_metadata=media_filter is not None,
             media_filter=media_filter,
         )
@@ -614,6 +642,7 @@ class WebdatasetPreparator:
             max_parts=50,
             media_filter=media_filter,
             output_path=meta_path if meta_path is not parent_path else None,
+            enable_sample_tables=enable_sample_tables,
         )
 
         pool = AggregatorPool(

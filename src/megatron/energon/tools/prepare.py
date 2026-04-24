@@ -195,6 +195,11 @@ def printify_json(data: Any) -> Any:
     default=None,
     type=click.Path(),
 )
+@click.option(
+    "--skip-sample-tables",
+    help="Skip writing samples/sample_parts SQLite tables. Safe for training-only use (training reads .tar.idx, not SQLite).",
+    is_flag=True,
+)
 def command(
     path: EPath,
     progress: bool,
@@ -215,6 +220,7 @@ def command(
     skip_dataset_yaml: bool,
     dataset_yaml_name: str,
     output: Optional[str],
+    skip_sample_tables: bool,
 ):
     """Prepare WebDataset for use with energon.
 
@@ -369,6 +375,7 @@ def command(
         workers=num_workers,
         media_filter=media_filter_config,
         fix_duplicates=fix_duplicates,
+        enable_sample_tables=not skip_sample_tables,
     )
 
     found_types = list(found_types)
