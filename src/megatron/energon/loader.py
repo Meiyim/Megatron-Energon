@@ -69,8 +69,8 @@ def get_savable_loader(
                 "Passing a worker_config to get_savable_loader() is deprecated and will have no effect."
             )
 
-    GlobalTarHandleManager.get_instance(max_handles=max_tar_handles, log_interval=1)
-    GlobalIdxHandleManager.get_instance(max_handles=max_idx_handles, log_interval=1)
+    GlobalTarHandleManager.get_instance(max_handles=max_tar_handles, log_interval=1000)
+    GlobalIdxHandleManager.get_instance(max_handles=max_idx_handles, log_interval=1000)
 
     return SavableDataLoader(
         dataset,

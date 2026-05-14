@@ -13,7 +13,7 @@ from megatron.energon.wrappers.base import BaseWrapperDataset
 T_sample = TypeVar("T_sample")
 
 # How often to log memory (in samples). 0 = disable.
-MEM_LOG_EVERY_N = int(os.environ.get("ENERGON_MEM_LOG_EVERY_N", "1"))
+MEM_LOG_EVERY_N = int(os.environ.get("ENERGON_MEM_LOG_EVERY_N", "0"))
 
 
 class WatchdogDataset(BaseWrapperDataset[T_sample, T_sample], Generic[T_sample]):
