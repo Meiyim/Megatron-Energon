@@ -4,7 +4,7 @@
 import math
 from typing import Any, Dict, Generic, Iterator, Optional, TypeVar, Union
 
-from megatron.energon.flavors.base_dataset import SavableDataset
+from megatron.energon.flavors.base_dataset import SavableDataset, add_sample_restore_key
 from megatron.energon.worker import WorkerConfig
 from megatron.energon.wrappers.base import BaseWrapperDataset
 
@@ -77,6 +77,7 @@ class RepeatDataset(BaseWrapperDataset[T_sample, T_sample], Generic[T_sample]):
 
             for sample in self.dataset:
                 self._index += 1
+                add_sample_restore_key(sample, self._repetition, src=self)
                 yield sample
                 if stop_after is not None and self._index >= stop_after:
                     break
