@@ -245,7 +245,12 @@ class PackingDataset(
         self._pre_packing_buffer.worker_start()
         self._reading_buffer.worker_start()
 
-        is_initial_pack = False
+        if self._pre_packing_buffer.len_worker() == 0 and pre_packing_lengths:
+            pre_packing_lengths.clear()
+        if self._reading_buffer.len_worker() == 0 and not pre_packing_lengths:
+            is_initial_pack = True
+        else:
+            is_initial_pack = False
 
         def encode_pack_samples(pack: List[T_sample]) -> List[T_encoded_sample]:
             """Encode the samples in the pack using the sample encoder."""

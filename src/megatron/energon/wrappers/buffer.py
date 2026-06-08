@@ -44,7 +44,10 @@ class SavableSampleBuffer(BaseWrapperDataset[T_sample, T_sample], Generic[T_samp
             assert len(self._buffer) == 0
             self._restore_pending = False
             for restore_key in self._restore_keys:
+                if restore_key is None:
+                    continue
                 self._buffer.append(self.restore_sample(restore_key))
+            self._restore_keys = [k for k in self._restore_keys if k is not None]
         assert len(self._buffer) == len(self._restore_keys)
 
     def append(self, sample: T_sample) -> T_sample:
