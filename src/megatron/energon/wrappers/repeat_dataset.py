@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import math
-from typing import Any, Dict, Generic, Iterator, Optional, TypeVar, Union
+from typing import Any, Dict, Generic, Iterator, Optional, Tuple, TypeVar, Union
 
 from megatron.energon.flavors.base_dataset import SavableDataset, add_sample_restore_key
 from megatron.energon.worker import WorkerConfig
@@ -100,6 +100,17 @@ class RepeatDataset(BaseWrapperDataset[T_sample, T_sample], Generic[T_sample]):
         else:
             # No more repeats
             self._repetition = math.ceil(self.repeats)
+
+    def restore_sample(self, restore_key: Tuple[Union[str, int, tuple], ...]) -> T_sample:
+        id, repetition = restore_key[:2]
+        assert id == type(self).__name__
+        assert isinstance(repetition, int)
+        restore_key = restore_key[2:]
+        return add_sample_restore_key(
+            self.dataset.restore_sample(restore_key),
+            repetition,
+            src=self,
+        )
 
     def config(self) -> Dict[str, Any]:
         return {
