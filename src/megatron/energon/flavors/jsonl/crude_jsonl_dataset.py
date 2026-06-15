@@ -130,7 +130,9 @@ class CrudeJsonlDatasetFactory(
             rotation_offset=worker_rotation_offset,
             subset=self.subset,
         )
-        _print_shard_slices(self.worker_config, virtual_shards, workers_sample_slice_offsets)
+        _print_shard_slices(
+            self.worker_config, virtual_shards, workers_sample_slice_offsets, self.path
+        )
 
         itar_reader = IJsonlReader(
             self.path,
