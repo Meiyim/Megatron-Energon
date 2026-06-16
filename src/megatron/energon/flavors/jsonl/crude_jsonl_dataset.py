@@ -3,7 +3,7 @@
 
 import json
 import logging
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from megatron.energon.cache import FileStore
 from megatron.energon.epathlib import EPath
@@ -84,7 +84,13 @@ class CrudeJsonlDatasetFactory(
         """
         assert self.__sample_type__ is not None, f"Class {type(self)} must define __sample_type__"
         self.path = path
-        self.paths = [path]
+        # A source may be a single .jsonl[.gz] file, or a directory of part files
+        # (part-*.jsonl[.gz]) that together form one logical dataset. Resolving a
+        # directory to its parts here keeps ONE blend entry per source regardless
+        # of how many parts it has — crucial when sources have hundreds/thousands
+        # of parts (otherwise metadataset init explodes).
+        self.part_paths = self._resolve_parts(path)
+        self.paths = list(self.part_paths)
         self.training = training
         self.worker_config = worker_config
         self.shuffle_over_epochs = shuffle_over_epochs
@@ -92,13 +98,59 @@ class CrudeJsonlDatasetFactory(
         self.max_samples_per_sequence = max_samples_per_sequence
         self.subset = subset
         self.part_filter = part_filter
-        if part_filter is None or part_filter("json"):
-            self._len = IJsonlIndexReader.count_samples(path)
-        else:
-            self._len = 0
-        assert self.path.size() == IJsonlIndexReader.size(path), (
-            "The index of the jsonl file does not match the file. Regenerate the index."
-        )
+
+        from megatron.energon.flavors.jsonl.gzip_support import is_gzip
+
+        # Per-part sample counts (used to build virtual shards) and total length.
+        self._part_counts = []
+        for p in self.part_paths:
+            cnt = IJsonlIndexReader.count_samples(p) if (part_filter is None or part_filter("json")) else 0
+            self._part_counts.append(cnt)
+            # The .jsonl.idx stores *uncompressed* byte offsets. For a plain file
+            # the last offset must equal the file size. For a .gz source the file
+            # size is the compressed size, so this consistency check does not
+            # apply (the gzip seek index keeps uncompressed offsets valid).
+            if not is_gzip(p):
+                assert p.size() == IJsonlIndexReader.size(p), (
+                    f"The index of {p} does not match the file. Regenerate the index."
+                )
+        self._len = sum(self._part_counts)
+
+    # Generated index sidecars that live next to the data parts and must never
+    # be mistaken for data files when scanning an extension-less part directory.
+    _SIDECAR_SUFFIXES = (".jsonl.idx", ".jsonl.idx.tmp", ".gzidx")
+
+    @classmethod
+    def _resolve_parts(cls, path: EPath) -> List[EPath]:
+        """Resolve a source path to its ordered list of jsonl part files.
+
+        - A file path → [that file].
+        - A directory → sorted part-*.jsonl / *.jsonl[.gz] inside it.
+        """
+        if path.is_file():
+            return [path]
+        if path.is_dir():
+            parts = sorted(
+                set(path.glob("*.jsonl")) | set(path.glob("*.jsonl.gz")),
+                key=lambda p: p.name,
+            )
+            if not parts:
+                # Extension-less part files (e.g. part-00000): take all regular
+                # files in the directory, in name order — but exclude the index
+                # sidecars (.jsonl.idx / .jsonl.idx.tmp / .gzidx) that prepare
+                # writes next to each part, or they'd be read as data.
+                parts = sorted(
+                    (
+                        p
+                        for p in path.glob("*")
+                        if p.is_file()
+                        and not any(p.name.endswith(s) for s in cls._SIDECAR_SUFFIXES)
+                    ),
+                    key=lambda p: p.name,
+                )
+            assert parts, f"No jsonl part files found in directory {path}"
+            return parts
+        raise FileNotFoundError(f"JSONL source path does not exist: {path}")
 
     def __len__(self) -> int:
         return self._len
@@ -117,10 +169,11 @@ class CrudeJsonlDatasetFactory(
 
         virtual_shards = [
             ShardInfo(
-                name=self.path.name,
-                path=self.path,
-                count=self._len,
+                name=p.name,
+                path=p,
+                count=cnt,
             )
+            for p, cnt in zip(self.part_paths, self._part_counts)
         ]
 
         workers_sample_slice_offsets = self.shard_workers(
@@ -135,7 +188,7 @@ class CrudeJsonlDatasetFactory(
         )
 
         itar_reader = IJsonlReader(
-            self.path,
+            self.part_paths,
             index_cache_size=parallel_shard_iters,
         )
 
@@ -157,7 +210,11 @@ class CrudeJsonlDatasetFactory(
     def as_file_store(self) -> "FileStore":
         from megatron.energon.cache.file_store import JsonlFileStore
 
-        return JsonlFileStore(self.path)
+        # Pass the resolved part list (not self.path): a directory-backed source
+        # has many parts, and JsonlFileStore/IJsonlReader must see all of them to
+        # resolve global sample indices. For a single-file source this is a
+        # one-element list, identical to the old behaviour.
+        return JsonlFileStore(self.part_paths)
 
     def _load_sample(self, sample: FilteredSample) -> CrudeSample:
         return CrudeSample(sample)

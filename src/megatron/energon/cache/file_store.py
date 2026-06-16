@@ -193,4 +193,7 @@ class JsonlFileStore(IJsonlReader, FileStore[bytes]):
     """This dataset will directly read entries from a jsonl file."""
 
     def get_path(self) -> str:
-        return str(self.jsonl_path)
+        # IJsonlReader stores the (possibly multi-part) source as ``jsonl_paths``.
+        # Return the first part's path as the representative dataset path; for a
+        # single-file source this is exactly that file.
+        return str(self.jsonl_paths[0])

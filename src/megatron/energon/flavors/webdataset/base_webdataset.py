@@ -212,6 +212,15 @@ class BaseWebdatasetFactory(
 def _print_shard_slices(
     worker_config: WorkerConfig, shards: List[ShardInfo], slice_offsets: Sequence[Sequence[int]], dataset_path: EPath
 ):
+    # This is verbose per-(dataset, worker) debug output. With large blends
+    # (thousands of leaf datasets × many workers) it produces hundreds of
+    # thousands of lines and dominates startup time, so it is opt-in via
+    # ENERGON_PRINT_SHARD_SLICES=1. Quiet by default.
+    import os as _os
+
+    if not _os.environ.get("ENERGON_PRINT_SHARD_SLICES"):
+        return
+
     shard_starts = np.cumsum([0] + [shard.count for shard in shards])
 
     def shard_range_info(start: int, end: int) -> str:

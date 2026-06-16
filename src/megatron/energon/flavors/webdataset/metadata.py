@@ -176,10 +176,14 @@ def get_dataset_type(path: EPath) -> EnergonDatasetType:
     metadata_db = path / MAIN_FOLDER_NAME / INDEX_SQLITE_FILENAME
 
     if path.is_file():
-        if path.name.endswith(".jsonl"):
+        if path.name.endswith(".jsonl") or path.name.endswith(".jsonl.gz"):
             result = EnergonDatasetType.JSONL
         elif path.name.endswith(".yaml"):
             result = EnergonDatasetType.METADATASET
+        elif _sniff_jsonl(path):
+            # Extension-less file whose first non-empty line is a JSON object →
+            # treat as JSONL. Robust against arbitrary part naming (part-00000).
+            result = EnergonDatasetType.JSONL
         else:
             result = EnergonDatasetType.INVALID
     elif check_dataset_info_present(path):
@@ -188,8 +192,95 @@ def get_dataset_type(path: EPath) -> EnergonDatasetType:
         # There is an sqlite, but no .info.json or .info.yaml,
         # so it's a filesystem dataset
         result = EnergonDatasetType.FILESYSTEM
+    elif path.is_dir() and _dir_is_jsonl(path):
+        # A directory of jsonl part files (no .nv-meta) is a single logical
+        # JSONL dataset split across parts. Detected by extension OR by
+        # sniffing the first part's first line as JSON (handles part-00000
+        # with no extension).
+        result = EnergonDatasetType.JSONL
     else:
         result = EnergonDatasetType.INVALID
 
     metadata_cache.put("dataset_type", str(path), result)
     return result
+
+
+def _sniff_jsonl(path: EPath) -> bool:
+    """Return True if the file's first non-empty line is a JSON object.
+
+    Supports plain and gzip-compressed files. Used so JSONL detection does not
+    depend solely on file extension (e.g. AFS exports named ``part-00000``).
+    """
+    try:
+        name = path.name
+        if name.endswith(".gz") or name.endswith(".jsonl.gz"):
+            import gzip
+
+            # GzipFile.close() does NOT close an externally-supplied fileobj, so
+            # open the raw handle in its own context manager to avoid leaking it.
+            with path.open("rb") as raw:
+                with gzip.GzipFile(fileobj=raw) as f:
+                    head = _first_nonblank_line(f)
+        else:
+            with path.open("rb") as f:
+                head = _first_nonblank_line(f)
+    except Exception:
+        return False
+    if head is None:
+        return False
+    head = head.strip()
+    if not head.startswith(b"{") or not head.endswith(b"}"):
+        return False
+    import json as _json
+
+    try:
+        _json.loads(head)
+        return True
+    except Exception:
+        return False
+
+
+def _first_nonblank_line(f, *, max_lines: int = 64) -> "bytes | None":
+    """Return the first line that is not blank (whitespace-only), or None.
+
+    Bounded to ``max_lines`` so a file of blank lines can't spin forever.
+    """
+    for _ in range(max_lines):
+        line = f.readline(1 << 16)
+        if not line:
+            return None
+        if line.strip():
+            return line
+    return None
+
+
+# Index sidecars that sit next to data parts and must be ignored when sniffing
+# a directory for JSONL content.
+_JSONL_SIDECAR_SUFFIXES = (".jsonl.idx", ".jsonl.idx.tmp", ".gzidx")
+
+
+def _dir_is_jsonl(path: EPath) -> bool:
+    """Return True if a directory looks like a (multi-part) JSONL dataset.
+
+    First tries extension globs (fast); otherwise sniffs candidate child files'
+    first line as JSON so extension-less part files are recognized too. Index
+    sidecars (.jsonl.idx / .gzidx) are skipped, and several candidates are tried
+    (not just the first) before giving up.
+    """
+    if next(path.glob("*.jsonl"), None) is not None:
+        return True
+    if next(path.glob("*.jsonl.gz"), None) is not None:
+        return True
+    candidates = sorted(
+        (
+            p
+            for p in path.glob("*")
+            if p.is_file()
+            and not any(p.name.endswith(s) for s in _JSONL_SIDECAR_SUFFIXES)
+        ),
+        key=lambda p: p.name,
+    )
+    for c in candidates[:4]:
+        if _sniff_jsonl(c):
+            return True
+    return False
