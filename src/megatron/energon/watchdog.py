@@ -572,15 +572,40 @@ class Watchdog:
             self.disable()
 
 
-def repr_short(obj: Any) -> str:
+def repr_short(obj: Any, _depth: int = 0) -> str:
     """
     Return a short repr of an object.
     """
+    if _depth > 2:
+        return f"<{type(obj).__name__}>"
+
     if isinstance(obj, torch.Tensor):
         if isinstance(obj, ShardedTensorBase) or obj.is_cuda:
-            return "<CUDA tensor>"
+            return f"<CUDA tensor shape={tuple(obj.shape)} dtype={obj.dtype}>"
+        return f"<CPU tensor shape={tuple(obj.shape)} dtype={obj.dtype}>"
 
-    s = repr(obj)
+    if isinstance(obj, dict):
+        items = list(obj.items())
+        parts = [f"{repr_short(k, _depth + 1)}: {repr_short(v, _depth + 1)}" for k, v in items[:8]]
+        if len(items) > 8:
+            parts.append("...")
+        return "{" + ", ".join(parts) + "}"
+
+    if isinstance(obj, (list, tuple, set, frozenset)):
+        items = list(obj)
+        parts = [repr_short(v, _depth + 1) for v in items[:8]]
+        if len(items) > 8:
+            parts.append("...")
+        if isinstance(obj, tuple):
+            return "(" + ", ".join(parts) + ("," if len(items) == 1 else "") + ")"
+        if isinstance(obj, (set, frozenset)):
+            return "{" + ", ".join(parts) + "}"
+        return "[" + ", ".join(parts) + "]"
+
+    try:
+        s = repr(obj)
+    except Exception as exc:
+        s = f"<repr failed for {type(obj).__name__}: {type(exc).__name__}: {exc}>"
     if len(s) > PRINT_LOCAL_MAX_LENGTH:
         s = s[: PRINT_LOCAL_MAX_LENGTH // 2] + "..." + s[-PRINT_LOCAL_MAX_LENGTH // 2 :]
     return s
