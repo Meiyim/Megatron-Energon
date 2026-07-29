@@ -8,7 +8,6 @@ from typing import (
     Any,
     Dict,
     Generator,
-    Optional,
     TypeVar,
     Union,
 )
@@ -19,6 +18,28 @@ from megatron.energon.flavors.jsonl.ijsonl import IJsonlFile, IJsonlIndexWriter
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T", covariant=True)
+
+
+def _local_copy(src: EPath):
+    """Context manager: if *src* is remote, copy to a temp file and yield its EPath.
+    If local, yield *src* directly. Temp file is deleted on exit."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _ctx():
+        if src.is_local():
+            yield src
+        else:
+            with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as tmp:
+                tmp_path = tmp.name
+            try:
+                logger.info("Copying remote jsonl to local temp: %s -> %s", src, tmp_path)
+                src.copy(EPath(tmp_path))
+                yield EPath(tmp_path)
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+
+    return _ctx()
 
 
 class JsonlPreparator:
@@ -32,25 +53,8 @@ class JsonlPreparator:
         Args:
             path: Path to the tar file.
         """
-        src = EPath(path)
-        # Remote jsonl files (BOS/S3) opened via multistorageclient may return a
-        # RemoteFileReader when the file exceeds the memory load limit (~512MB).
-        # RemoteFileReader raises io.UnsupportedOperation for readline(), which
-        # breaks jsonl indexing. Copy remote files to a local temp file first so
-        # that readline()/tell()/seek() work natively.
-        if not src.is_local():
-            with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as tmp:
-                tmp_path = tmp.name
-            try:
-                src.copy(EPath(tmp_path))
-                with EPath(tmp_path).open("rb") as f:
-                    with IJsonlFile(f) as index_reader:
-                        for entry in index_reader:
-                            yield {"json": entry}
-            finally:
-                Path(tmp_path).unlink(missing_ok=True)
-        else:
-            with src.open("rb") as f:
+        with _local_copy(EPath(path)) as local_path:
+            with local_path.open("rb") as f:
                 with IJsonlFile(f) as index_reader:
                     for entry in index_reader:
                         yield {"json": entry}
@@ -71,23 +75,7 @@ class JsonlPreparator:
             Count of samples in the jsonl file.
         """
         src = EPath(path)
-        # Remote jsonl files (BOS/S3) opened via multistorageclient may return a
-        # RemoteFileReader when the file exceeds the memory load limit (~512MB).
-        # RemoteFileReader raises io.UnsupportedOperation for readline(), which
-        # breaks jsonl indexing. Copy remote files to a local temp file first so
-        # that readline()/tell()/seek() work natively. The index (.jsonl.idx) is
-        # still written to the original remote path via IJsonlIndexWriter.
-        tmp_path: Optional[str] = None
-        if not src.is_local():
-            with tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False) as tmp:
-                tmp_path = tmp.name
-            logger.info(f"Copying remote jsonl to local temp file: {src.url} -> {tmp_path}")
-            src.copy(EPath(tmp_path))
-            read_path = EPath(tmp_path)
-        else:
-            read_path = src
-
-        try:
+        with _local_copy(src) as read_path:
             count = 0
             # Processing is lagging behind. The offsets include empty lines. The whole file must be covered!
             last_offset = 0
@@ -113,7 +101,5 @@ class JsonlPreparator:
                     )
                     assert last_offset != 0, "File is empty."
                     iw.append(last_offset)
-            return count
-        finally:
-            if tmp_path is not None:
-                Path(tmp_path).unlink(missing_ok=True)
+        return count
+

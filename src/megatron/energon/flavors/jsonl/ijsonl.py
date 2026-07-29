@@ -1,27 +1,13 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import io
-import logging
 import struct
-import threading
 from typing import BinaryIO, Dict, Generator, Optional, Tuple, Union
 
 from megatron.energon.edataclass import edataclass
 from megatron.energon.epathlib import EPath
 
-logger = logging.getLogger(__name__)
-
 IJSONL_SUFFIX = ".jsonl.idx"
-
-# Process-level cache for remote idx file bytes.
-# Key: str(index_path.url). Value: bytes of the whole idx file.
-# Each worker process downloads each remote idx only once, then all
-# IJsonlIndexReader instances on that process share the same in-memory
-# copy via BytesIO. This avoids BOS throttling when many workers open
-# the same remote idx simultaneously.
-_REMOTE_IDX_CACHE: Dict[str, bytes] = {}
-_REMOTE_IDX_CACHE_LOCK = threading.Lock()
 
 
 @edataclass
@@ -39,33 +25,12 @@ class IJsonlSamplePointer:
     byte_size: int
 
 
-def _load_remote_idx(index_path: EPath) -> bytes:
-    """Download a remote .jsonl.idx file once per process and cache it."""
-    cache_key = str(index_path.url)
-    with _REMOTE_IDX_CACHE_LOCK:
-        cached = _REMOTE_IDX_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-    logger.info(f"Downloading remote jsonl idx to memory: {cache_key}")
-    with index_path.open("rb") as f:
-        data = f.read()
-    with _REMOTE_IDX_CACHE_LOCK:
-        _REMOTE_IDX_CACHE[cache_key] = data
-    return data
-
-
 class IJsonlIndexReader:
     def __init__(self, jsonl_path: Union[EPath, str]):
         jsonl_path = EPath(jsonl_path)
         index_path = jsonl_path.with_suffix(IJSONL_SUFFIX)
         self._length = index_path.size() // 8
-        if index_path.is_local():
-            self.ijsonl = index_path.open("rb")
-        else:
-            # Remote idx: download once per process, wrap in BytesIO so
-            # all read/seek/tell calls are local and never hit BOS again.
-            data = _load_remote_idx(index_path)
-            self.ijsonl = io.BytesIO(data)
+        self.ijsonl = index_path.open("rb")
 
     def __getitem__(self, index: int) -> int:
         if index >= self._length or index < 0:
