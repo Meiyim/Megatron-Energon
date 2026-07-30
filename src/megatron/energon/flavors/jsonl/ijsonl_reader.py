@@ -1,8 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import logging
-import tempfile
 from abc import ABC
 from typing import (
     Callable,
@@ -21,8 +19,6 @@ from megatron.energon.flavors.jsonl.ijsonl import (
 )
 from megatron.energon.flavors.webdataset.structs import FilteredSample
 from megatron.energon.source_info import SourceInfo
-
-logger = logging.getLogger(__name__)
 
 T_index = TypeVar("T_index", covariant=False)
 
@@ -53,18 +49,6 @@ class IJsonlReader(ABC):
         sample_filter: Optional[Callable[[str], bool]] = None,
         index_cache_size: int = 5,
     ):
-        # Remote jsonl files may not support readline/tell/seek (e.g. BOS
-        # RemoteFileReader for large files). Copy to a local temp file so that
-        # all file operations work natively. The temp file is kept open for the
-        # lifetime of this reader and deleted on close.
-        self._tmp_jsonl = None
-        if not jsonl_path.is_local():
-            self._tmp_jsonl = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
-            tmp_path = self._tmp_jsonl.name
-            self._tmp_jsonl.close()
-            logger.info("Copying remote jsonl to local temp: %s -> %s", jsonl_path, tmp_path)
-            jsonl_path.copy(EPath(tmp_path))
-            jsonl_path = EPath(tmp_path)
         self.jsonl_path = jsonl_path
         self.sample_filter = sample_filter
         self.cached_offset_reader = CachedIJsonlOffsetReader(
@@ -204,10 +188,3 @@ class IJsonlReader(ABC):
         if self.ijsonl_file is not None:
             self.ijsonl_file.close()
         self.cached_offset_reader.close()
-        if self._tmp_jsonl is not None:
-            import os as _os
-            try:
-                _os.unlink(self._tmp_jsonl.name)
-            except OSError:
-                pass
-            self._tmp_jsonl = None

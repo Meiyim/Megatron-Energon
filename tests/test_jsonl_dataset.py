@@ -268,6 +268,77 @@ class TestJsonlDataset(unittest.TestCase):
             assert len(cnt) == 55 * 3
             assert all(2 <= v <= 5 for v in cnt.values())
 
+    def test_remote_reader_preserves_identity(self):
+        """Regression: reading a remote (msc://) jsonl must use the remote path and the
+        remote .jsonl.idx directly via seek()+read(size). It must NOT stage the whole
+        file into a per-reader local temp copy, which would (a) break .idx addressing
+        (the tmp .jsonl.idx is never created) and (b) corrupt SourceInfo/__shard__
+        identity by replacing the msc:// path with a random /tmp name."""
+        from megatron.energon.cache.file_store import JsonlFileStore
+        from megatron.energon.epathlib import EPath
+
+        with setup_s3_emulator(profile_name="s3test_jsonl_reader") as emu:
+            emu.add_file(self.dataset_path, "test/dataset")
+            remote_path = EPath("msc://s3test_jsonl_reader/test/dataset/ds1.jsonl")
+
+            reader = JsonlFileStore(remote_path)
+            try:
+                # Index lookup over the remote .jsonl.idx must work.
+                assert len(reader) == 55, f"Expected 55, got {len(reader)}"
+                # The reader must keep the original remote path (no local /tmp staging).
+                assert str(reader.jsonl_path).startswith("msc://"), reader.jsonl_path
+                # Random access uses seek(offset)+read(size); identity must be preserved.
+                sample = reader[0]
+                assert sample is not None
+                src = sample["__sources__"][0]
+                assert src.dataset_path.startswith("msc://"), src.dataset_path
+                assert sample["__shard__"] == "ds1.jsonl", sample["__shard__"]
+            finally:
+                reader.close()
+
+    def test_remote_prepare_writes_idx_to_source_path(self):
+        """Regression: preparing a remote (msc://) jsonl must download it locally for the
+        readline()-based index scan (the >512MB RemoteFileReader lacks readline()), yet
+        write the resulting .jsonl.idx back to the ORIGINAL remote path -- not to the
+        random /tmp copy. After preparation, indexed reads over the remote path must work
+        and preserve the remote identity."""
+        from megatron.energon.cache.file_store import JsonlFileStore
+        from megatron.energon.epathlib import EPath
+        from megatron.energon.flavors.jsonl.jsonl_prepare import JsonlPreparator
+
+        # A raw jsonl with NO .idx yet (do not run prepare locally).
+        raw_path = self.dataset_path / "remote_prep.jsonl"
+        with open(raw_path, "w") as f:
+            for i in range(30):
+                f.write(json.dumps({"idx": i, "txt": f"{i}"}) + "\n")
+
+        with setup_s3_emulator(profile_name="s3test_remote_prepare") as emu:
+            # Upload only the raw jsonl (bucket "test", key "prep/remote_prep.jsonl").
+            emu.add_file(raw_path, "test/prep/remote_prep.jsonl")
+            assert "prep/remote_prep.jsonl.idx" not in emu.list_objects("test")
+
+            remote_path = EPath("msc://s3test_remote_prepare/test/prep/remote_prep.jsonl")
+
+            # Prepare on the remote path: local copy for the scan, idx written remotely.
+            count = JsonlPreparator.prepare_dataset(remote_path)
+            assert count == 30, count
+
+            # The .idx must land next to the original remote jsonl, not the temp copy.
+            assert "prep/remote_prep.jsonl.idx" in emu.list_objects("test")
+
+            # Indexed reads over the remote path must work and keep the remote identity.
+            reader = JsonlFileStore(remote_path)
+            try:
+                assert len(reader) == 30, len(reader)
+                sample = reader[7]
+                assert sample is not None
+                assert json.loads(sample["json"])["idx"] == 7, sample["json"]
+                src = sample["__sources__"][0]
+                assert src.dataset_path.startswith("msc://"), src.dataset_path
+                assert sample["__shard__"] == "remote_prep.jsonl", sample["__shard__"]
+            finally:
+                reader.close()
+
     def test_prepare(self):
         print("Creating new dataset")
         with open(self.dataset_path / "ds_prep.jsonl", "w") as f:
