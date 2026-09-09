@@ -330,6 +330,9 @@ def _patch_s3_fork_safety():
     the same sockets causes interleaved HTTP bytes and FlexibleChecksumError.
 
     This patch recreates both clients lazily on the first S3 operation after fork.
+    The main process needs a rust client too, not only forked workers: it uploads
+    checkpoints, and with no rust client MSC falls back to boto3 ``upload_fileobj``,
+    which shares one BytesIO across part-upload threads (crashes at 128-rank scale).
     """
     global _s3_fork_safety_patched
     if _s3_fork_safety_patched:
@@ -349,6 +352,7 @@ def _patch_s3_fork_safety():
         self._s3_create_args = args
         self._s3_create_kwargs = kwargs
         self._s3_client_pid = os.getpid()
+        _live_providers.add(self)
         return client
 
     S3StorageProvider._create_s3_client = _patched_create
@@ -357,14 +361,30 @@ def _patch_s3_fork_safety():
 
     def _patched_create_rust(self, rust_client_options=None):
         self._rust_client_options_saved = rust_client_options
-        return None  # created lazily in workers
+        return None  # built on first use below, and reset after fork
 
     S3StorageProvider._create_rust_client = _patched_create_rust
 
     _orig_translate = S3StorageProvider._translate_errors
     import threading
+    import weakref
     _fork_safety_lock = threading.Lock()
     _main_process_pid = os.getpid()
+    _live_providers = weakref.WeakSet()
+    # An inherited rust client must not be dropped in the child either: its thread
+    # pool does not survive fork, so running the destructor there can hang. Park it.
+    _inherited_rust_clients = []
+
+    def _reset_after_fork():
+        # _translate_errors is not a complete gateway -- s3.py:911/1004 use the rust
+        # client without it -- so clear inherited state before the child runs anything.
+        for provider in list(_live_providers):
+            if getattr(provider, "_rust_client", None) is not None:
+                _inherited_rust_clients.append(provider._rust_client)
+            provider._rust_client = None
+            provider._s3_fork_ready_pid = None
+
+    os.register_at_fork(after_in_child=_reset_after_fork)
 
     def _patched_translate(self, func, operation, bucket, key):
         current_pid = os.getpid()
@@ -380,13 +400,16 @@ def _patch_s3_fork_safety():
                             f"[S3_FORK_SAFETY] Recreated S3 client: "
                             f"pid={current_pid}, operation={operation}, bucket={bucket}"
                         )
-                    if is_child and self._rust_client is None:
+                    if self._rust_client is None and (
+                        is_child or os.environ.get("ENERGON_S3_RUST_IN_MAIN", "1") != "0"
+                    ):
                         rust_opts = getattr(self, "_rust_client_options_saved", None)
                         if rust_opts is not None:
                             self._rust_client = _orig_create_rust(self, rust_opts)
                             logger.info(
                                 f"[S3_FORK_SAFETY] Created fresh Rust client: "
-                                f"pid={current_pid}, operation={operation}, bucket={bucket}"
+                                f"pid={current_pid}, is_child={is_child}, "
+                                f"operation={operation}, bucket={bucket}"
                             )
                     self._s3_fork_ready_pid = current_pid
 
