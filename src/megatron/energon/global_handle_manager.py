@@ -413,10 +413,20 @@ def _patch_s3_fork_safety():
                             )
                     self._s3_fork_ready_pid = current_pid
 
+        return _orig_translate(self, func, operation, bucket, key)
+
+    S3StorageProvider._translate_errors = _patched_translate
+
+    _orig_upload = S3StorageProvider._upload_file
+
+    def _patched_upload(self, remote_path, f, attributes=None, content_type=None):
         max_retries = 5
         for attempt in range(max_retries + 1):
             try:
-                return _orig_translate(self, func, operation, bucket, key)
+                # Retrying the whole _upload_file re-runs its f.seek(0), so a retry
+                # after a partial upload restarts from the beginning instead of
+                # seeing the pointer at EOF and uploading 0 bytes / truncating.
+                return _orig_upload(self, remote_path, f, attributes, content_type)
             except (RuntimeError, RetryableError) as e:
                 err_msg = str(e)
                 is_retryable = isinstance(e, RetryableError) or any(
@@ -431,12 +441,12 @@ def _patch_s3_fork_safety():
                     raise
                 wait = min(1.0 * (2 ** attempt), 30.0)
                 logger.warning(
-                    f"[S3_RATE_LIMIT] {operation} {bucket}/{key}: {err_msg}, "
+                    f"[S3_RATE_LIMIT] {remote_path}: {err_msg}, "
                     f"retry {attempt + 1}/{max_retries} in {wait:.1f}s"
                 )
                 time.sleep(wait)
 
-    S3StorageProvider._translate_errors = _patched_translate
+    S3StorageProvider._upload_file = _patched_upload
 
     _s3_fork_safety_patched = True
     logger.info("[S3_FORK_SAFETY] S3StorageProvider patched for fork-safety")
