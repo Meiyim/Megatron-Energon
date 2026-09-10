@@ -370,16 +370,46 @@ def _patch_s3_fork_safety():
     import weakref
     _fork_safety_lock = threading.Lock()
     _main_process_pid = os.getpid()
+    # WeakSet is correct here, do not "fix" it to a strong set: MSC clients are
+    # owned solely by their provider, and any in-flight operation holds `self`, so
+    # a provider that is collectable has no live client left to reset. Holding
+    # providers strongly would instead keep them (and their sockets) alive forever.
     _live_providers = weakref.WeakSet()
-    # An inherited rust client must not be dropped in the child either: its thread
-    # pool does not survive fork, so running the destructor there can hang. Park it.
+    # Marks that the current thread is already inside _patched_upload's retry loop.
+    # Used instead of matching operation == "PUT", because not every PUT comes from
+    # _upload_file: _make_symlink (s3.py:672) and the public put_object
+    # (providers/base.py:628) also pass operation="PUT", and gating on the string
+    # would silently strip their retry.
+    _upload_retry_depth = threading.local()
+
+    def _in_upload_retry():
+        return getattr(_upload_retry_depth, "active", False)
+
     _inherited_rust_clients = []
+
+    _MAX_RETRIES = 5
+    _RETRY_KEYWORDS = (
+        "SlowDown", "429", "503", "RateLimitExceeded",
+        "RequestRateLimitExceeded", "Throttl", "TooManyRequest",
+        "Failed to GET", "Failed to PUT",
+    )
+
+    def _is_retryable(err):
+        return isinstance(err, RetryableError) or any(
+            kw in str(err) for kw in _RETRY_KEYWORDS
+        )
 
     def _reset_after_fork():
         # _translate_errors is not a complete gateway -- s3.py:911/1004 use the rust
         # client without it -- so clear inherited state before the child runs anything.
         for provider in list(_live_providers):
             if getattr(provider, "_rust_client", None) is not None:
+                # Park, never drop: the rust client's tokio runtime does not survive
+                # fork, so running its destructor in the child could hang.
+                # Bounded, and deliberately never reclaimed: this hook is registered
+                # after_in_child only, so the main process never appends; a child
+                # appends once per live provider (MSC keeps one provider per profile,
+                # see shortcuts.py _STORAGE_CLIENT_CACHE) and never forks again.
                 _inherited_rust_clients.append(provider._rust_client)
             provider._rust_client = None
             provider._s3_fork_ready_pid = None
@@ -413,38 +443,57 @@ def _patch_s3_fork_safety():
                             )
                     self._s3_fork_ready_pid = current_pid
 
-        return _orig_translate(self, func, operation, bucket, key)
+        # Uploads are retried by _patched_upload, which re-enters _upload_file and
+        # therefore re-runs its f.seek(0); retrying _invoke_api here would skip that
+        # seek and upload from EOF. Everything else (GET/HEAD/LIST/COPY/DELETE) has
+        # no caller-owned file pointer to rewind, so retry throttling right here.
+        #
+        # Caveat: the rust recursive-list path (s3.py:894) does `yield from
+        # self._translate_errors(...)` over a generator _invoke_api, so its errors
+        # surface while the generator is consumed, i.e. outside this try block. That
+        # path is therefore not covered here.
+        if _in_upload_retry():
+            return _orig_translate(self, func, operation, bucket, key)
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                return _orig_translate(self, func, operation, bucket, key)
+            except (RuntimeError, RetryableError) as e:
+                if not _is_retryable(e) or attempt >= _MAX_RETRIES:
+                    raise
+                wait = min(1.0 * (2 ** attempt), 30.0)
+                logger.warning(
+                    f"[S3_RATE_LIMIT] {operation} {bucket}/{key}: {e}, "
+                    f"retry {attempt + 1}/{_MAX_RETRIES} in {wait:.1f}s"
+                )
+                time.sleep(wait)
 
     S3StorageProvider._translate_errors = _patched_translate
 
     _orig_upload = S3StorageProvider._upload_file
 
     def _patched_upload(self, remote_path, f, attributes=None, content_type=None):
-        max_retries = 5
-        for attempt in range(max_retries + 1):
-            try:
-                # Retrying the whole _upload_file re-runs its f.seek(0), so a retry
-                # after a partial upload restarts from the beginning instead of
-                # seeing the pointer at EOF and uploading 0 bytes / truncating.
-                return _orig_upload(self, remote_path, f, attributes, content_type)
-            except (RuntimeError, RetryableError) as e:
-                err_msg = str(e)
-                is_retryable = isinstance(e, RetryableError) or any(
-                    kw in err_msg
-                    for kw in (
-                        "SlowDown", "429", "503", "RateLimitExceeded",
-                        "RequestRateLimitExceeded", "Throttl", "TooManyRequest",
-                        "Failed to GET", "Failed to PUT",
+        outermost = not _in_upload_retry()
+        if outermost:
+            _upload_retry_depth.active = True
+        try:
+            for attempt in range(_MAX_RETRIES + 1):
+                try:
+                    # Retrying the whole _upload_file re-runs its f.seek(0), so a retry
+                    # after a partial upload restarts from the beginning instead of
+                    # seeing the pointer at EOF and uploading 0 bytes / truncating.
+                    return _orig_upload(self, remote_path, f, attributes, content_type)
+                except (RuntimeError, RetryableError) as e:
+                    if not _is_retryable(e) or attempt >= _MAX_RETRIES:
+                        raise
+                    wait = min(1.0 * (2 ** attempt), 30.0)
+                    logger.warning(
+                        f"[S3_RATE_LIMIT] {remote_path}: {e}, "
+                        f"retry {attempt + 1}/{_MAX_RETRIES} in {wait:.1f}s"
                     )
-                )
-                if not is_retryable or attempt >= max_retries:
-                    raise
-                wait = min(1.0 * (2 ** attempt), 30.0)
-                logger.warning(
-                    f"[S3_RATE_LIMIT] {remote_path}: {err_msg}, "
-                    f"retry {attempt + 1}/{max_retries} in {wait:.1f}s"
-                )
-                time.sleep(wait)
+                    time.sleep(wait)
+        finally:
+            if outermost:
+                _upload_retry_depth.active = False
 
     S3StorageProvider._upload_file = _patched_upload
 
