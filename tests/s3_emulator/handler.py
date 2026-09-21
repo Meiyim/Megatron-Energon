@@ -137,6 +137,27 @@ class S3RequestHandler(BaseHTTPRequestHandler):
             self._send_status(HTTPStatus.OK)
             return
 
+        # Server-side copy (CopyObject): x-amz-copy-source: /<src_bucket>/<src_key>
+        copy_source = self.headers.get("x-amz-copy-source")
+        if copy_source:
+            src = _up.unquote(copy_source).lstrip("/")
+            src_bucket, _, src_key = src.partition("/")
+            try:
+                data = self.server.state.get_object(src_bucket, src_key)
+            except FileNotFoundError:
+                self._send_error(HTTPStatus.NOT_FOUND, f"Copy source not found: {src}")
+                return
+            self.server.state.put_object(bucket, key, data)
+            xml = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                "<CopyObjectResult>"
+                f"<LastModified>{formatdate(usegmt=True)}</LastModified>"
+                f"<ETag>{_etag(data)}</ETag>"
+                "</CopyObjectResult>"
+            ).encode()
+            self._send_bytes(xml, status=HTTPStatus.OK, content_type="application/xml")
+            return
+
         # Put object
         self.server.state.put_object(bucket, key, body)
         self._send_status(
