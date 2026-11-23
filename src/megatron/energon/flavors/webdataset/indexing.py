@@ -2,15 +2,20 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import sqlite3
-import struct
-from typing import BinaryIO, Generator, List, Optional, Tuple, Union
-
-from numpy import int8
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Generator, Optional, Tuple
 
 from megatron.energon.epathlib import EPath
+from megatron.energon.flavors.common.sqlite import ThreadLocalSqlite
 from megatron.energon.flavors.webdataset.itar import ITarRawSamplePartPointer, ITarSamplePointer
-from megatron.energon.flavors.webdataset.thread_local_sqlite import ThreadLocalSqlite
 from megatron.energon.local_copy import ensure_local_copy
+
+if TYPE_CHECKING:
+    from megatron.energon.flavors.webdataset.prepare import (
+        IndexMediaMetadata,
+        IndexSample,
+        IndexSamplePart,
+    )
 
 
 class DuplicateSampleKeyError(RuntimeError):
@@ -49,6 +54,16 @@ class SqliteIndexWriter:
                          part_name TEXT,
                          content_byte_offset INTEGER,
                          content_byte_size INTEGER)
+        if enable_media_metadata is True, it also creates the media_metadata table:
+          - media_metadata(entry_key TEXT PRIMARY KEY,
+                           metadata_type TEXT NOT NULL,
+                           metadata_json TEXT NOT NULL)
+        if enable_media_metadata is True, it also creates the media_filters table:
+          - media_filters(filter_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                          strategy TEXT NOT NULL,
+                          patterns TEXT,
+                          created_at_utc TEXT DEFAULT CURRENT_TIMESTAMP,
+                          UNIQUE(strategy, patterns))
         Also creates indexes:
           - samples(sample_key)
           - samples(tar_file_id, sample_index)
@@ -64,7 +79,6 @@ class SqliteIndexWriter:
 
         # Initialize SQLite connection
         # Only supporting local file system, because sqlite does not support remote file systems.
-        # TODO: Implement remote file systems. Maybe create locally in tmp then upload?
         path = self.sqlite_path.local_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(path)
@@ -129,78 +143,90 @@ class SqliteIndexWriter:
                 """
             )
 
-    def append_sample(
+    def append_samples(
         self,
-        tar_file_id: int8,
-        sample_key: str,
-        sample_index: int,
-        byte_offset: Optional[int],
-        byte_size: Optional[int],
-    ):
-        """
-        Adds a new sample row to the samples table.
-
-        Args:
-            tar_file_id: The index of the tar file in the reader.
-            sample_key: The key of the sample.
-            sample_index: The index of the sample in the tar file.
-            byte_offset: The byte offset of the sample in the tar file.
-            byte_size: The size of the sample in the tar file.
-        """
+        rows: Sequence["IndexSample"],
+    ) -> None:
+        """Insert multiple sample rows efficiently."""
 
         assert self.db is not None, "Database is closed"
 
-        # Insert a row in the samples table
+        if len(rows) == 0:
+            return
+
+        savepoint_name = "append_samples_batch"
+        self.db.execute(f"SAVEPOINT {savepoint_name}")
         try:
-            self.db.execute(
+            # One executemany() is substantially cheaper than one execute() per row.
+            self.db.executemany(
                 """
                 INSERT INTO samples (tar_file_id, sample_key, sample_index, byte_offset, byte_size)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                (tar_file_id, sample_key, sample_index, byte_offset, byte_size),
+                (
+                    (
+                        row.tar_file_id,
+                        row.sample_key,
+                        row.sample_index,
+                        row.byte_offset,
+                        row.byte_size,
+                    )
+                    for row in rows
+                ),
             )
-        except sqlite3.IntegrityError as exc:  # pragma: no cover - defensive programming
-            raise DuplicateSampleKeyError(sample_key) from exc
+            self.db.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+        except sqlite3.IntegrityError as exc:
+            # executemany() may already have inserted earlier rows in the batch
+            self.db.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
+            self.db.execute(f"RELEASE SAVEPOINT {savepoint_name}")
+            raise DuplicateSampleKeyError(self._find_duplicate_sample_key(rows)) from exc
 
-    def append_part(
+    def append_parts(
         self,
-        tar_file_id: int8,
-        sample_index: int,
-        part_name: str,
-        content_byte_offset: int,
-        content_byte_size: int,
-    ):
-        """Adds a new part row to the samples table."""
+        rows: Sequence["IndexSamplePart"],
+    ) -> None:
+        """Insert multiple sample part rows efficiently."""
 
         assert self.db is not None, "Database is closed"
 
-        # Insert a row in the sample parts table
-        self.db.execute(
+        if len(rows) == 0:
+            return
+
+        self.db.executemany(
             """
             INSERT INTO sample_parts (tar_file_id, sample_index, part_name, content_byte_offset, content_byte_size)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (tar_file_id, sample_index, part_name, content_byte_offset, content_byte_size),
+            (
+                (
+                    row.tar_file_id,
+                    row.sample_index,
+                    row.part_name,
+                    row.content_byte_offset,
+                    row.content_byte_size,
+                )
+                for row in rows
+            ),
         )
 
-    def append_media_metadata(
+    def append_media_metadata_batch(
         self,
-        entry_key: str,
-        metadata_type: str,
-        metadata_json: str,
+        rows: Sequence["IndexMediaMetadata"],
     ) -> None:
-        """Insert or update a media metadata record."""
+        """Insert or update multiple media metadata records efficiently."""
 
         assert self.enable_media_metadata, "Adding media metadata, although not enabled"
-
         assert self.db is not None, "Database is closed"
 
-        self.db.execute(
+        if len(rows) == 0:
+            return
+
+        self.db.executemany(
             """
             INSERT OR REPLACE INTO media_metadata (entry_key, metadata_type, metadata_json)
             VALUES (?, ?, ?)
             """,
-            (entry_key, metadata_type, metadata_json),
+            ((row.entry_key, row.metadata_type, row.metadata_json) for row in rows),
         )
 
     def append_media_filter(self, *, strategy: str, patterns: str | None) -> None:
@@ -219,10 +245,7 @@ class SqliteIndexWriter:
 
         if self.enable_sample_tables:
             # Create the index after adding all the samples for better speed
-            # Index on sample_key for fast lookups
-            self.db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_samples_sample_key ON samples(sample_key)"
-            )
+            # sample_key uniqueness already creates an implicit SQLite index via the table schema.
 
             # Create index on the samples table.  Help the planner if it chooses `samples` as the probe side of the join
             self.db.execute(
@@ -251,49 +274,35 @@ class SqliteIndexWriter:
         # If an exception occurred, do not finalize (so you can inspect the temp file)
         self.close()
 
+    def _find_duplicate_sample_key(
+        self,
+        rows: Sequence["IndexSample"],
+    ) -> str:
+        """Resolve the sample key responsible for a uniqueness violation.
 
-class JoinIndexWriter:
-    """Describes how one primary dataset is joined with multiple secondary datasets.
-
-    For fast random access, this is a binary format that is memory-mapped.
-    The first 16 bytes are a header with the number of columns (1 primary + N secondary).
-    Each row contains (shard_idx, byte_offset, byte_size) for each column.
-    """
-
-    def __init__(self, join_index_path: EPath):
-        self.join_index_path = join_index_path
-        self.join_index_file = join_index_path.open("wb")
-        self.num_columns = None
-
-    def append(self, *columns: Tuple[int, int, int]):
-        """Appends a new row to the join index file.
-
-        Each row contains (shard_idx, byte_offset, byte_size) for each column.
+        sqlite3 only tells us that *some* row in the batch violated the unique
+        constraint. We do a targeted follow-up lookup so the caller still gets
+        the concrete duplicate key in the raised error.
         """
 
-        if self.num_columns is None:
-            # Write the number of columns
-            self.join_index_file.write(b"JIDX0001")  # Magic bytes with version
-            self.join_index_file.write(struct.pack("q", len(columns)))
-            self.num_columns = len(columns)
-        else:
-            assert len(columns) == self.num_columns, (
-                f"Inconsistent number of keys: Had {self.num_columns} before, got {len(columns)}"
-            )
+        assert self.db is not None, "Database is closed"
 
-        # Write the columns
-        for key in columns:
-            assert isinstance(key, tuple) and len(key) == 3
-            self.join_index_file.write(struct.pack("qqq", *key))
+        seen_in_batch: set[str] = set()
+        for row in rows:
+            sample_key = row.sample_key
+            if sample_key in seen_in_batch:
+                return sample_key
 
-    def close(self):
-        self.join_index_file.close()
+            existing = self.db.execute(
+                "SELECT 1 FROM samples WHERE sample_key = ?",
+                (sample_key,),
+            ).fetchone()
+            if existing is not None:
+                return sample_key
 
-    def __enter__(self):
-        return self
+            seen_in_batch.add(sample_key)
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+        return rows[0].sample_key
 
 
 class SqliteIndexReader:
@@ -310,6 +319,9 @@ class SqliteIndexReader:
                    part_name TEXT,
                    content_byte_offset INTEGER,
                    content_byte_size INTEGER)
+    - media_metadata(entry_key TEXT PRIMARY KEY,
+                     metadata_type TEXT NOT NULL,
+                     metadata_json TEXT NOT NULL)
     """
 
     sqlite_path: EPath
@@ -502,120 +514,6 @@ class SqliteIndexReader:
         if self.db is not None:
             self.db.thread_close()
             del self.db
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-
-class JoinIndexReader:
-    """Reads a join index file in different ways.
-
-    If a column is specified, only that column is read, otherwise the full rows.
-    You can iterate over the rows, or read a specific row by index, or get the full tensor.
-
-    Each row contains (shard_idx, byte_offset, byte_size) for each column.
-    """
-
-    join_index_path: EPath
-    join_index_file: BinaryIO
-    column: Optional[int]
-    num_columns: int
-    has_iterated: bool
-    index_row_position: int
-
-    def __init__(self, join_index_path: EPath, column: Optional[int] = None):
-        self.join_index_path = join_index_path
-        self.join_index_byte_size = join_index_path.size()
-
-        self.column = column
-
-        self.join_index_file = join_index_path.open("rb")
-        self.has_iterated = False
-        self.index_row_position = -1
-
-        # Read the header
-        bytes_magic = self.join_index_file.read(8)
-        assert isinstance(bytes_magic, bytes)
-        assert bytes_magic[:4] == b"JIDX", f"Invalid magic bytes: {bytes_magic}"
-        assert bytes_magic[4:8] == b"0001", f"Unsupported version: {bytes_magic[4:8]}"
-
-        # Read the number of columns
-        bytes_seckeys = self.join_index_file.read(8)
-        assert isinstance(bytes_seckeys, bytes)
-        self.num_columns = struct.unpack("q", bytes_seckeys)[0]
-
-        self.index_row_position = 0
-
-    def get_as_tensor(self):
-        """Returns the join index as a tensor with shape (N, num_columns, 3)."""
-
-        assert not self.has_iterated, "Cannot get_as_tensor after iterating"
-
-        import torch
-
-        # Read the raw bytes for all N * 3 int64s.
-        data = self.join_index_file.read()
-        self.index_file_position = self.join_index_file.tell()
-        assert len(data) % (8 * 3) == 0, (
-            f"Index file reading: Expected multiple of 3 * 8 bytes, got {len(data)} bytes"
-        )
-
-        return torch.frombuffer(data, dtype=torch.int64).view(-1, self.num_columns, 3)
-
-    def __len__(self):
-        return (self.join_index_byte_size - 16) // (self.num_columns * 8 * 3)
-
-    def __iter__(self):
-        return self
-
-    def _read_one_row(
-        self, column: Optional[int] = None
-    ) -> Union[None, List[Tuple[int, int, int]]]:
-        row = []
-        for col_idx in range(self.num_columns):
-            if column is not None and col_idx != column:
-                # Skip this column
-                self.join_index_file.seek(8 * 3, 1)
-                continue
-
-            bytes_key = self.join_index_file.read(8 * 3)
-            if not bytes_key:
-                return None
-            assert isinstance(bytes_key, bytes)
-            key_tuple = struct.unpack("qqq", bytes_key)
-            row.append(key_tuple)
-        self.index_row_position += 1
-        return row
-
-    def __next__(self) -> Union[None, List[Tuple[int, int, int]]]:
-        self.has_iterated = True
-        return self._read_one_row(column=self.column)
-
-    def tell_row(self) -> int:
-        return self.index_row_position
-
-    def __getitem__(self, idx: int) -> List[Tuple[int, int, int]]:
-        """Reads the idx-th row of the join index file."""
-
-        assert 0 <= idx < len(self), f"Index out of bounds: {idx} not in [0, {len(self)})"
-
-        # Seek to the correct position
-
-        if self.index_row_position != idx:
-            self.join_index_file.seek(16 + idx * self.num_columns * 8 * 3)
-            self.index_row_position = idx
-
-        # Read the secondary keys
-        row = self._read_one_row(column=self.column)
-        assert row is not None, f"Failed to read row {idx}"
-
-        return row
-
-    def close(self):
-        self.join_index_file.close()
 
     def __enter__(self):
         return self

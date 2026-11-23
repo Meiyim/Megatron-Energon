@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from megatron.energon.cache import DecodeFileStore, FileCacheLazy, FileStore, FileStoreCachePool
-from megatron.energon.flavors.webdataset.sample_decoder import SampleDecoder
+from megatron.energon.decoders import SampleDecoder
 from megatron.energon.source_info import SourceInfo
 
 
@@ -620,7 +620,10 @@ class TestFileStoreCachePool(unittest.TestCase):
                 lazy_ref = pool.get_lazy(mock_raw_file_store, filename)
                 sample_for_source_info = {"__sources__": ()}
                 result = lazy_ref.get(sample_for_source_info)
-                assert sample_for_source_info["__sources__"][0].dataset_path == mock_raw_file_store.get_path()
+                assert (
+                    sample_for_source_info["__sources__"][0].dataset_path
+                    == mock_raw_file_store.get_path()
+                )
                 assert sample_for_source_info["__sources__"][0].index is None
                 assert sample_for_source_info["__sources__"][0].shard_name is None
                 assert sample_for_source_info["__sources__"][0].file_names == (filename,)

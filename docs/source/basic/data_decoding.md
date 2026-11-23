@@ -29,7 +29,10 @@ class MyTaskEncoder(DefaultTaskEncoder):
 ```
 
 Typically, you will just instantiate a {py:class}`SampleDecoder <megatron.energon.SampleDecoder>` and provide the arguments to configure it, as shown above.
-If you do **not** want automatic decoding at all, you have to explicitely set `decoder = None` in your TaskEncoder.
+If you do **not** want automatic decoding at all, explicitly set `decoder = None` in your TaskEncoder.
+Payload parts then remain bytes: text is not converted to a string, JSON is not parsed, and images are not converted to PIL images or tensors. Primary and auxiliary {py:class}`FileStore <megatron.energon.FileStore>` results also remain undecoded.
+
+This is useful for byte-preserving copying and hashing, selective or custom decoding, validation, metadata extraction, and offline dataset transformation. It does not prevent the selected payload from being read; combine it with a cooker `part_filter` when unused parts should not be loaded. See {ref}`linear-data-processing` for a complete finite, one-pass processing example.
 
 Here are the different options you can pass to {py:class}`SampleDecoder <megatron.energon.SampleDecoder>`:
 
@@ -69,8 +72,8 @@ The arguments are more or less identical to what can be passed to `SampleDecoder
 ## AV Decoder (Audio and Video)
 
 Energon comes with code to efficiently decode compressed video and audio files such as MP4, MP3 or WAV.
-It integrates a library called `fastseek` that allows to quickly extract sub-clips from longer videos.
-The actual decoding is done by PyAV which in turn relies on ffmpeg.
+It uses PyAV, and through it FFmpeg, to decode the actual media data.
+For efficient video sub-clip extraction, `AVDecoder` uses FFmpeg/PyAV container index entries where available and falls back to probing the file when an index is not available.
 
 When choosing `AVDecoder` as the option for `av_decode` above, an object of the type {py:class}`AVDecoder <megatron.energon.av.AVDecoder>` (click to see methods) will be returned. 
 At this point, the file has not yet been decoded, but in your [custom sample loader](custom-sample-loader) or in your [TaskEncoder](../basic/task_encoder), you can read parts or all of the file using the methods of `AVDecoder`.
