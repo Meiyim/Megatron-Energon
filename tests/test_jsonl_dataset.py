@@ -326,6 +326,82 @@ class TestJsonlDataset(unittest.TestCase):
             set(range(0, 20)) | set(range(100, 120))
         ), "all samples present exactly once"
 
+    def test_multi_jsonl_reader_cumsum_bisect_boundary(self):
+        """ShardInfosIJsonlReader: global idx → (shard, local) at shard edges and
+        across a synthetic count=0 shard (energon's prepare rejects an empty file,
+        so this is the only way the boundary can be exercised)."""
+        import json as _json
+
+        from megatron.energon.epathlib import EPath
+        from megatron.energon.flavors.jsonl.ijsonl_reader import ShardInfosIJsonlReader
+        from megatron.energon.flavors.webdataset.structs import ShardInfo
+
+        a = self.dataset_path / "a.jsonl"
+        c = self.dataset_path / "c.jsonl"
+        self.create_text_test_dataset(a, range(0, 20), range(0, 20))
+        self.create_text_test_dataset(c, range(100, 120), range(100, 120))
+        shards = [
+            ShardInfo(name="a.jsonl", path=EPath(str(a)), count=20),
+            ShardInfo(name="empty.jsonl", path=EPath(str(a)), count=0),  # count=0 in the middle
+            ShardInfo(name="c.jsonl", path=EPath(str(c)), count=20),
+        ]
+        reader = ShardInfosIJsonlReader(EPath(str(self.dataset_path)), shards, index_cache_size=4)
+        assert len(reader) == 40
+
+        def probe(global_idx):
+            s = reader[global_idx]
+            # restore_key carries the GLOBAL index so savable restore re-addresses
+            # the same sample (same contract as webdataset's ShardInfosITarReader).
+            assert s["__restore_key__"] == ("Webdataset", global_idx), s["__restore_key__"]
+            return _json.loads(s["json"])["idx"], s["__shard__"], s["__key__"]
+
+        # shard a: globals 0..19 -> local 0..19
+        assert probe(0) == (0, "a.jsonl", "0")
+        assert probe(19) == (19, "a.jsonl", "19")
+        # the count=0 shard is skipped: global 20 is the first sample of shard c
+        assert probe(20) == (100, "c.jsonl", "20")
+        assert probe(39) == (119, "c.jsonl", "39")
+        with self.assertRaises(IndexError):
+            reader[40]
+        reader.close()
+
+    def test_jsonl_directory_s3(self):
+        """A directory of jsonl shards on object storage (msc://) loads as one dataset."""
+        torch.manual_seed(42)
+        srcdir = self.dataset_path / "srcdir_s3"
+        srcdir.mkdir()
+        self.create_text_test_dataset(srcdir / "part-00000.jsonl", range(0, 30), range(0, 30))
+        self.create_text_test_dataset(srcdir / "part-00001.jsonl", range(100, 130), range(100, 130))
+        self.create_text_test_dataset(srcdir / "part-00002.jsonl", range(200, 230), range(200, 230))
+        expected = set(range(0, 30)) | set(range(100, 130)) | set(range(200, 230))
+
+        from megatron.energon.epathlib import EPath
+        from megatron.energon.flavors.webdataset.metadata import (
+            EnergonDatasetType,
+            get_dataset_type,
+        )
+
+        with setup_s3_emulator(profile_name="s3test_jsonl_dir") as emu:
+            emu.add_file(srcdir, "test/srcdir")  # uploads the *.jsonl + their .jsonl.idx
+            remote = EPath("msc://s3test_jsonl_dir/test/srcdir")
+
+            assert get_dataset_type(remote) == EnergonDatasetType.JSONL, (
+                "a msc:// directory of *.jsonl must be detected as JSONL"
+            )
+
+            train_dataset = get_train_dataset(
+                remote,
+                worker_config=WorkerConfig(rank=0, world_size=1, num_workers=0, seed_offset=42),
+                batch_size=1,
+                shuffle_buffer_size=None,
+                max_samples_per_sequence=None,
+                task_encoder=SimpleCookingTaskEncoder(),
+                repeat=False,
+            )
+            assert len(train_dataset) == 90, f"Expected 90, got {len(train_dataset)}"
+            seen = Counter(int(i) for data in get_loader(train_dataset) for i in data.idx)
+            assert set(seen) == expected and all(v == 1 for v in seen.values())
+
     def test_s3(self):
         # Create a joined dataset configuration
         mixed_mds_path = self.dataset_path / "metadataset_mixed.yaml"

@@ -94,7 +94,10 @@ class CrudeJsonlDatasetFactory(
 
         # A directory = one logical source over many jsonl shards (like a WebDataset
         # over many tars); a file = a single-shard dataset (unchanged behaviour).
-        self.is_multi_shard = path.is_dir()
+        # Name-based, not is_dir(): object stores (msc:///bos://) do not reliably
+        # report a prefix as a directory. A path ending in ``.jsonl`` is a single
+        # file; anything else is a directory of shards (one logical source).
+        self.is_multi_shard = not path.name.endswith(".jsonl")
         if self.is_multi_shard:
             from megatron.energon.flavors.jsonl.jsonl_shards import list_jsonl_shards
 
