@@ -84,7 +84,6 @@ class CrudeJsonlDatasetFactory(
         """
         assert self.__sample_type__ is not None, f"Class {type(self)} must define __sample_type__"
         self.path = path
-        self.paths = [path]
         self.training = training
         self.worker_config = worker_config
         self.shuffle_over_epochs = shuffle_over_epochs
@@ -92,19 +91,36 @@ class CrudeJsonlDatasetFactory(
         self.max_samples_per_sequence = max_samples_per_sequence
         self.subset = subset
         self.part_filter = part_filter
-        if part_filter is None or part_filter("json"):
-            self._len = IJsonlIndexReader.count_samples(path)
+
+        # A directory = one logical source over many jsonl shards (like a WebDataset
+        # over many tars); a file = a single-shard dataset (unchanged behaviour).
+        self.is_multi_shard = path.is_dir()
+        if self.is_multi_shard:
+            from megatron.energon.flavors.jsonl.jsonl_shards import list_jsonl_shards
+
+            self.paths = list_jsonl_shards(path)
+            if not self.paths:
+                raise ValueError(f"No *.jsonl shards found under directory {path}")
         else:
-            self._len = 0
-        assert self.path.size() == IJsonlIndexReader.size(path), (
-            "The index of the jsonl file does not match the file. Regenerate the index."
-        )
+            self.paths = [path]
+
+        enabled = part_filter is None or part_filter("json")
+        self._shard_counts = []
+        for p in self.paths:
+            self._shard_counts.append(IJsonlIndexReader.count_samples(p) if enabled else 0)
+            assert p.size() == IJsonlIndexReader.size(p), (
+                f"The index of the jsonl file {p} does not match the file. Regenerate the index."
+            )
+        self._len = sum(self._shard_counts)
 
     def __len__(self) -> int:
         return self._len
 
     def build(self, worker_rotation_offset: int = 0) -> SavableDataset[CrudeSample]:
-        from megatron.energon.flavors.jsonl.ijsonl_reader import IJsonlReader
+        from megatron.energon.flavors.jsonl.ijsonl_reader import (
+            IJsonlReader,
+            ShardInfosIJsonlReader,
+        )
 
         if self.parallel_shard_iters is None:
             if self.training:
@@ -116,11 +132,8 @@ class CrudeJsonlDatasetFactory(
             parallel_shard_iters = self.parallel_shard_iters
 
         virtual_shards = [
-            ShardInfo(
-                name=self.path.name,
-                path=self.path,
-                count=self._len,
-            )
+            ShardInfo(name=p.name, path=p, count=count)
+            for p, count in zip(self.paths, self._shard_counts)
         ]
 
         workers_sample_slice_offsets = self.shard_workers(
@@ -134,10 +147,17 @@ class CrudeJsonlDatasetFactory(
             self.worker_config, virtual_shards, workers_sample_slice_offsets, self.path
         )
 
-        itar_reader = IJsonlReader(
-            self.path,
-            index_cache_size=parallel_shard_iters,
-        )
+        if self.is_multi_shard:
+            itar_reader = ShardInfosIJsonlReader(
+                self.path,
+                virtual_shards,
+                index_cache_size=parallel_shard_iters,
+            )
+        else:
+            itar_reader = IJsonlReader(
+                self.path,
+                index_cache_size=parallel_shard_iters,
+            )
 
         dataset = WebdatasetSampleLoaderDataset(
             join_readers=[itar_reader],
@@ -157,6 +177,11 @@ class CrudeJsonlDatasetFactory(
     def as_file_store(self) -> "FileStore":
         from megatron.energon.cache.file_store import JsonlFileStore
 
+        if self.is_multi_shard:
+            raise NotImplementedError(
+                "as_file_store is not supported for a multi-shard jsonl directory "
+                f"({self.path}); it is only defined for a single jsonl file."
+            )
         return JsonlFileStore(self.path)
 
     def _load_sample(self, sample: FilteredSample) -> CrudeSample:
@@ -173,6 +198,13 @@ class CrudeJsonlDatasetFactory(
             training=self.training,
             _path=str(self.path),
             jsonl_filename=self.path.name,
+            # Multi-shard dirs record their shard names+counts so the config (used
+            # for cache keying/determinism) changes when the shard set changes.
+            jsonl_shards=(
+                [(p.name, c) for p, c in zip(self.paths, self._shard_counts)]
+                if self.is_multi_shard
+                else None
+            ),
             count=self._len,
             shuffle_over_epochs=self.shuffle_over_epochs,
             parallel_shard_iters=self.parallel_shard_iters,

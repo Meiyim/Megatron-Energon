@@ -225,6 +225,107 @@ class TestJsonlDataset(unittest.TestCase):
                 f"Sample {i} should have been seen exactly once, but was seen {sample_counts[i]} times."
             )
 
+    def test_jsonl_directory_as_one_dataset(self):
+        """A directory of *.jsonl shards loads as one dataset (one logical source)."""
+        torch.manual_seed(42)
+        srcdir = self.dataset_path / "srcdir"
+        srcdir.mkdir()
+        self.create_text_test_dataset(srcdir / "part-00000.jsonl", range(0, 30), range(0, 30))
+        self.create_text_test_dataset(srcdir / "part-00001.jsonl", range(100, 130), range(100, 130))
+        self.create_text_test_dataset(srcdir / "part-00002.jsonl", range(200, 230), range(200, 230))
+        expected = set(range(0, 30)) | set(range(100, 130)) | set(range(200, 230))
+
+        worker_config = WorkerConfig(rank=0, world_size=1, num_workers=0, seed_offset=42)
+        train_dataset = get_train_dataset(
+            srcdir,
+            worker_config=worker_config,
+            batch_size=1,
+            shuffle_buffer_size=None,
+            max_samples_per_sequence=None,
+            task_encoder=SimpleCookingTaskEncoder(),
+            repeat=False,
+        )
+        assert len(train_dataset) == 90, f"Expected 90 samples, got {len(train_dataset)}"
+        seen = Counter(int(i) for data in get_loader(train_dataset) for i in data.idx)
+        assert set(seen) == expected, "directory must yield exactly the union of its shards"
+        assert all(v == 1 for v in seen.values()), "each sample exactly once per epoch"
+
+    def test_jsonl_directory_multirank(self):
+        """3-way rank split over a jsonl directory covers every sample exactly once."""
+        torch.manual_seed(42)
+        srcdir = self.dataset_path / "srcdir_mr"
+        srcdir.mkdir()
+        self.create_text_test_dataset(srcdir / "part-00000.jsonl", range(0, 30), range(0, 30))
+        self.create_text_test_dataset(srcdir / "part-00001.jsonl", range(100, 130), range(100, 130))
+        self.create_text_test_dataset(srcdir / "part-00002.jsonl", range(200, 230), range(200, 230))
+        expected = set(range(0, 30)) | set(range(100, 130)) | set(range(200, 230))
+
+        seen = Counter()
+        for cur_rank in range(3):
+            worker_config = WorkerConfig(
+                rank=cur_rank, world_size=3, num_workers=2, seed_offset=42
+            )
+            train_dataset = get_train_dataset(
+                srcdir,
+                worker_config=worker_config,
+                batch_size=1,
+                shuffle_buffer_size=None,
+                max_samples_per_sequence=None,
+                task_encoder=SimpleCookingTaskEncoder(),
+                repeat=False,
+            )
+            for data in get_loader(train_dataset):
+                for i in data.idx:
+                    seen[int(i)] += 1
+        assert set(seen) == expected and all(v == 1 for v in seen.values()), (
+            f"multirank split wrong: {Counter(seen.values())}"
+        )
+
+    def test_jsonl_shard_order_is_relpath_sorted(self):
+        """Shards sort by relative path, not basename — same-named parts in two
+        subdirs keep a stable, cross-run order (else the global index drifts)."""
+        from megatron.energon.epathlib import EPath
+        from megatron.energon.flavors.jsonl.jsonl_shards import list_jsonl_shards
+
+        root = self.dataset_path / "collide"
+        (root / "a").mkdir(parents=True)
+        (root / "b").mkdir(parents=True)
+        # Same basename in two subdirs — basename sort would tie.
+        self.create_text_test_dataset(root / "a" / "part-00000.jsonl", range(0, 5), range(0, 5))
+        self.create_text_test_dataset(root / "b" / "part-00000.jsonl", range(5, 10), range(5, 10))
+        shards = list_jsonl_shards(EPath(str(root)))
+        rels = [str(p.relative_to(EPath(str(root)))) for p in shards]
+        assert rels == ["a/part-00000.jsonl", "b/part-00000.jsonl"], rels
+
+    def test_jsonl_directory_build_is_reproducible(self):
+        """Two builds of the same directory (same seed) yield the identical global
+        order — guards the shard enumeration + cumsum mapping against drift."""
+        torch.manual_seed(42)
+        srcdir = self.dataset_path / "srcdir_repro"
+        srcdir.mkdir()
+        self.create_text_test_dataset(srcdir / "part-00000.jsonl", range(0, 20), range(0, 20))
+        self.create_text_test_dataset(srcdir / "part-00001.jsonl", range(100, 120), range(100, 120))
+
+        def one_pass():
+            wc = WorkerConfig(rank=0, world_size=1, num_workers=0, seed_offset=42)
+            ds = get_train_dataset(
+                srcdir,
+                worker_config=wc,
+                batch_size=1,
+                shuffle_buffer_size=None,
+                max_samples_per_sequence=None,
+                task_encoder=SimpleCookingTaskEncoder(),
+                repeat=False,
+            )
+            return [int(i) for data in get_loader(ds) for i in data.idx]
+
+        order1 = one_pass()
+        order2 = one_pass()
+        assert order1 == order2, "same directory + seed must give identical global order"
+        assert sorted(order1) == sorted(
+            set(range(0, 20)) | set(range(100, 120))
+        ), "all samples present exactly once"
+
     def test_s3(self):
         # Create a joined dataset configuration
         mixed_mds_path = self.dataset_path / "metadataset_mixed.yaml"

@@ -160,6 +160,14 @@ def check_dataset_info_present(path: EPath) -> bool:
     return result
 
 
+def _dir_has_jsonl(path: EPath) -> bool:
+    # Function-scope import: the jsonl package imports webdataset at module load,
+    # so a top-level import here would be a cycle.
+    from megatron.energon.flavors.jsonl.jsonl_shards import dir_has_jsonl
+
+    return dir_has_jsonl(path)
+
+
 def get_dataset_type(path: EPath) -> EnergonDatasetType:
     """Get the type of the dataset at the given path.
 
@@ -188,6 +196,9 @@ def get_dataset_type(path: EPath) -> EnergonDatasetType:
         # There is an sqlite, but no .info.json or .info.yaml,
         # so it's a filesystem dataset
         result = EnergonDatasetType.FILESYSTEM
+    elif _dir_has_jsonl(path):
+        # A plain directory of *.jsonl shards = one JSONL dataset, many shards.
+        result = EnergonDatasetType.JSONL
     else:
         result = EnergonDatasetType.INVALID
 
