@@ -181,7 +181,7 @@ class SubsetRatioMixin:
 
 @edataclass
 class DatasetReference(SubsetRatioMixin, DatasetLoaderInterface):
-    path: Union[str, EPath]
+    path: Union[str, EPath, List[Union[str, EPath]]]
 
     split_part: Optional[str] = None
     subflavors: Optional[Dict[str, Any]] = None
@@ -198,9 +198,22 @@ class DatasetReference(SubsetRatioMixin, DatasetLoaderInterface):
 
     def post_initialize(self, mds_path: Optional[EPath] = None) -> None:
         assert mds_path is not None
-        if not isinstance(self.path, EPath):
-            self.path = mds_path.parent / self.path
-        ds_type = get_dataset_type(self.path)
+        if isinstance(self.path, (list, tuple)):
+            # A list of jsonl dirs/files = one logical JSONL source; resolve each
+            # item relative to the metadataset, it is JSONL by construction. An
+            # item may be ``{path, tag}``; the tag is display-only (read straight
+            # from the metadataset by the viewer) and dropped here.
+            from megatron.energon.flavors.jsonl.jsonl_shards import item_path
+
+            self.path = [
+                p if isinstance(p, EPath) else (mds_path.parent / p)
+                for p in (item_path(it) for it in self.path)
+            ]
+            ds_type = EnergonDatasetType.JSONL
+        else:
+            if not isinstance(self.path, EPath):
+                self.path = mds_path.parent / self.path
+            ds_type = get_dataset_type(self.path)
         if ds_type == EnergonDatasetType.METADATASET:
             assert self.aux is None, "Cannot specify auxiliary datasets for crude datasets"
             assert self.dataset_config is None, "Must not set dataset_config"

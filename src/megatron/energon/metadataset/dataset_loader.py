@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.
 # SPDX-License-Identifier: BSD-3-Clause
 
-from typing import Any, Dict, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from megatron.energon.dataset_config import get_dataset_from_config
 from megatron.energon.edataclass import edataclass
@@ -21,7 +21,7 @@ from megatron.energon.worker import WorkerConfig
 class DatasetLoader(DatasetLoaderInterface):
     """Loads a dataset from a path."""
 
-    path: Union[str, EPath]
+    path: Union[str, EPath, List[Union[str, EPath]]]
     split_part: Optional[str] = None
     subflavors: Optional[Dict[str, Any]] = None
     shuffle_over_epochs_multiplier: Optional[int] = 1

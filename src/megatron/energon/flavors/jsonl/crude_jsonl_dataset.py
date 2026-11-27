@@ -92,20 +92,16 @@ class CrudeJsonlDatasetFactory(
         self.subset = subset
         self.part_filter = part_filter
 
-        # A directory = one logical source over many jsonl shards (like a WebDataset
-        # over many tars); a file = a single-shard dataset (unchanged behaviour).
-        # Name-based, not is_dir(): object stores (msc:///bos://) do not reliably
-        # report a prefix as a directory. A path ending in ``.jsonl`` is a single
-        # file; anything else is a directory of shards (one logical source).
-        self.is_multi_shard = not path.name.endswith(".jsonl")
-        if self.is_multi_shard:
-            from megatron.energon.flavors.jsonl.jsonl_shards import list_jsonl_shards
+        from megatron.energon.flavors.jsonl.jsonl_shards import resolve_jsonl_shards
 
-            self.paths = list_jsonl_shards(path)
-            if not self.paths:
-                raise ValueError(f"No *.jsonl shards found under directory {path}")
-        else:
-            self.paths = [path]
+        # A single ``.jsonl`` file = single-shard dataset. A directory, or an explicit
+        # list of dirs/files, = one logical source over many shards (global cumsum +
+        # shuffle), so blend weight stays source-level. Name-based, not is_dir():
+        # object stores do not reliably report a prefix as a directory.
+        self.is_multi_shard = not (isinstance(path, EPath) and path.name.endswith(".jsonl"))
+        self.paths = resolve_jsonl_shards(path)
+        if not self.paths:
+            raise ValueError(f"No *.jsonl shards resolved from {path}")
 
         enabled = part_filter is None or part_filter("json")
         self._shard_counts = []
@@ -151,8 +147,9 @@ class CrudeJsonlDatasetFactory(
         )
 
         if self.is_multi_shard:
+            base_path = self.path if isinstance(self.path, EPath) else self.paths[0]
             itar_reader = ShardInfosIJsonlReader(
-                self.path,
+                base_path,
                 virtual_shards,
                 index_cache_size=parallel_shard_iters,
             )
@@ -200,7 +197,7 @@ class CrudeJsonlDatasetFactory(
             type=type(self).__qualname__,
             training=self.training,
             _path=str(self.path),
-            jsonl_filename=self.path.name,
+            jsonl_filename=(self.path.name if isinstance(self.path, EPath) else None),
             # Multi-shard dirs record their shard names+counts so the config (used
             # for cache keying/determinism) changes when the shard set changes.
             jsonl_shards=(

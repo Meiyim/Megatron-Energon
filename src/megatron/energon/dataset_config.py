@@ -91,9 +91,13 @@ def get_dataset_from_config(
     Returns:
         The instantiated dataset
     """
-    path = EPath(path)
+    # A list of jsonl dirs/files = one logical JSONL source (global-cumsum shuffle
+    # pool); it is JSONL by construction, so skip single-path type detection.
+    is_path_list = isinstance(path, (list, tuple))
+    if not is_path_list:
+        path = EPath(path)
     dataset: BaseCoreDatasetFactory[T_sample]
-    ds_type = get_dataset_type(path)
+    ds_type = EnergonDatasetType.JSONL if is_path_list else get_dataset_type(path)
     if ds_type == EnergonDatasetType.JSONL:
         assert sample_type is CrudeSample or sample_type is None, (
             f"Sample type must be CrudeSample for jsonl datasets, but got {sample_type}"

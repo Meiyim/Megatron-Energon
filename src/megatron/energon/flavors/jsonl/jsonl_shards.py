@@ -8,9 +8,20 @@ Shared by ``get_dataset_type`` (type detection), ``CrudeJsonlDatasetFactory``
 on which files a jsonl directory contains and in what order.
 """
 
-from typing import Generator
+from typing import Generator, Mapping
 
 from megatron.energon.epathlib import EPath
+
+
+def item_path(item):
+    """The path of an inline-list source item, dropping any display tag.
+
+    A list item is either a bare path (str/EPath) or a ``{"path": ..., "tag": ...}``
+    mapping; the ``tag`` is display-only provenance and never affects which shards
+    the source resolves to. (A 2-element ``[path, tag]`` tuple is NOT accepted: it
+    is ambiguous with a two-path list.)
+    """
+    return item["path"] if isinstance(item, Mapping) else item
 
 
 def _is_jsonl(path: EPath) -> bool:
@@ -35,6 +46,33 @@ def list_jsonl_shards(path: EPath) -> list[EPath]:
     index, so an unstable order breaks cook reproducibility and savable restore.
     """
     return sorted(iter_jsonl_shards(path), key=lambda p: p.relative_to(path))
+
+
+def resolve_jsonl_shards(path) -> list[EPath]:
+    """Flatten a jsonl source spec into its ordered shard list.
+
+    Accepts a single ``.jsonl`` file (-> itself), a directory (-> its ``*.jsonl``
+    shards), or an explicit list mixing dirs and files (-> each resolved and
+    concatenated in list order). The list form lets one logical source span files
+    that do not share a directory, while the global cumsum still treats them as one
+    shuffle pool. Within a directory entry the order is relative-path-sorted (stable
+    across runs); the list order itself is honored so cumsum is reproducible.
+    """
+    items = list(path) if isinstance(path, (list, tuple)) else [path]
+    out: list[EPath] = []
+    seen: set[str] = set()
+    for it in items:
+        it = item_path(it)
+        p = it if isinstance(it, EPath) else EPath(str(it))
+        shards = [p] if p.name.endswith(".jsonl") else list_jsonl_shards(p)
+        for s in shards:
+            # Dedup (first-occurrence order): overlapping items (a dir plus a file
+            # under it, or a dir listed twice) must not read the same shard twice,
+            # which would inflate the cumsum and disagree with EDF's leaf counting.
+            if s.url not in seen:
+                seen.add(s.url)
+                out.append(s)
+    return out
 
 
 def dir_has_jsonl(path: EPath) -> bool:
